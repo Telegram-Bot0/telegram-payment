@@ -3,7 +3,9 @@ import logging
 import re
 import time
 import uuid
-from datetime import datetime
+import signal
+import sys
+from datetime import datetime, timezone
 from typing import Dict, List
 
 from telegram import (
@@ -43,39 +45,56 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ================= GRACEFUL SHUTDOWN =================
+def signal_handler(signum, frame):
+    """Handle shutdown signals gracefully"""
+    logger.info("Received shutdown signal. Stopping bot gracefully...")
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
+
 # ================= DATABASE SETUP =================
 def initialize_database():
     """Initialize database connection with retry logic"""
+    logger.info("Initializing database connection...")
+    
     max_retries = 3
     for attempt in range(max_retries):
         try:
             client = MongoClient(
                 MONGO_URI,
-                serverSelectionTimeoutMS=15000,
-                connectTimeoutMS=15000,
-                socketTimeoutMS=15000,
+                serverSelectionTimeoutMS=10000,
+                connectTimeoutMS=10000,
+                socketTimeoutMS=10000,
                 maxPoolSize=10,
-                minPoolSize=1
+                minPoolSize=1,
+                retryWrites=True,
+                retryReads=True
             )
+            
+            # Test connection
             client.admin.command('ping')
+            logger.info(f"Database ping successful (attempt {attempt + 1})")
+            
             db = client.telegram_payment_bot
             users_col = db.users
             deposits_col = db.deposits
             withdrawals_col = db.withdrawals
             
-            # Create indexes
+            # Create indexes if they don't exist
             users_col.create_index("telegram_id", unique=True)
             deposits_col.create_index("utr", unique=True)
             deposits_col.create_index("status")
             withdrawals_col.create_index("status")
             
-            logger.info("Database connection established successfully")
+            logger.info("Database indexes created/verified")
             return users_col, deposits_col, withdrawals_col, client
             
-        except PyMongoError as e:
-            logger.warning(f"Database connection attempt {attempt + 1} failed: {e}")
+        except Exception as e:
+            logger.warning(f"Database connection attempt {attempt + 1} failed: {str(e)[:100]}")
             if attempt < max_retries - 1:
-                time.sleep(2)
+                time.sleep(3)
             else:
                 logger.error("All database connection attempts failed. Running in fallback mode.")
                 return None, None, None, None
@@ -151,6 +170,11 @@ def get_cancel_keyboard():
     ]]
     return InlineKeyboardMarkup(keyboard)
 
+# ================= UTILITY FUNCTIONS =================
+def get_current_utc_time():
+    """Get current UTC time (timezone aware)"""
+    return datetime.now(timezone.utc)
+
 # ================= USER MANAGEMENT =================
 def get_or_create_user(telegram_id: int, username: str = None):
     """Get user from DB or create if not exists"""
@@ -163,7 +187,7 @@ def get_or_create_user(telegram_id: int, username: str = None):
             "balance": 0.0,
             "total_deposits": 0.0,
             "total_withdrawals": 0.0,
-            "created_at": datetime.utcnow()
+            "created_at": get_current_utc_time()
         }
     
     try:
@@ -176,8 +200,8 @@ def get_or_create_user(telegram_id: int, username: str = None):
                 "balance": 0.0,
                 "total_deposits": 0.0,
                 "total_withdrawals": 0.0,
-                "created_at": datetime.utcnow(),
-                "updated_at": datetime.utcnow()
+                "created_at": get_current_utc_time(),
+                "updated_at": get_current_utc_time()
             }},
             upsert=True,
             return_document=ReturnDocument.AFTER
@@ -192,18 +216,19 @@ def get_or_create_user(telegram_id: int, username: str = None):
             "balance": 0.0,
             "total_deposits": 0.0,
             "total_withdrawals": 0.0,
-            "created_at": datetime.utcnow()
+            "created_at": get_current_utc_time()
         }
 
 def update_user_balance(telegram_id: int, amount: float, is_deposit: bool = True):
     """Update user balance after deposit/withdrawal"""
     if users_col is None:
+        logger.warning("Cannot update balance: Database not available")
         return False
     
     try:
         update_data = {
             "$inc": {"balance": amount},
-            "$set": {"updated_at": datetime.utcnow()}
+            "$set": {"updated_at": get_current_utc_time()}
         }
         
         if is_deposit:
@@ -211,11 +236,18 @@ def update_user_balance(telegram_id: int, amount: float, is_deposit: bool = True
         else:
             update_data["$inc"]["total_withdrawals"] = amount
             
-        users_col.update_one(
+        result = users_col.update_one(
             {"telegram_id": telegram_id},
             update_data
         )
-        return True
+        
+        if result.modified_count > 0:
+            logger.debug(f"Updated balance for user {telegram_id}: {'+' if is_deposit else '-'}{amount}")
+            return True
+        else:
+            logger.warning(f"Failed to update balance for user {telegram_id}")
+            return False
+            
     except Exception as e:
         logger.error(f"Error updating balance for user {telegram_id}: {e}")
         return False
@@ -625,9 +657,9 @@ async def handle_utr(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "utr": utr,
             "screenshot_id": context.user_data.get("screenshot_id"),
             "status": "REQUESTED",
-            "created_at": datetime.utcnow(),
-            "updated_at": datetime.utcnow(),
-            "last_reminder": datetime.utcnow(),
+            "created_at": get_current_utc_time(),
+            "updated_at": get_current_utc_time(),
+            "last_reminder": get_current_utc_time(),
             "admin_msg_id": None
         }
         
@@ -823,8 +855,8 @@ async def handle_confirm_withdraw(update: Update, context: ContextTypes.DEFAULT_
             "upi_id": upi_id,
             "amount": amount,
             "status": "REQUESTED",
-            "created_at": datetime.utcnow(),
-            "updated_at": datetime.utcnow(),
+            "created_at": get_current_utc_time(),
+            "updated_at": get_current_utc_time(),
             "admin_msg_id": None
         }
         
@@ -933,7 +965,7 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
             if deposits_col is not None:
                 deposits_col.update_one(
                     {"utr": utr},
-                    {"$set": {"status": "COMPLETED", "updated_at": datetime.utcnow()}}
+                    {"$set": {"status": "COMPLETED", "updated_at": get_current_utc_time()}}
                 )
             
             # Update user balance
@@ -945,7 +977,7 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"• User: {deposit['user_id']}\n"
                 f"• Amount: ₹{deposit['amount']}\n"
                 f"• UTR: `{utr}`\n"
-                f"• Time: {datetime.utcnow().strftime('%H:%M:%S')}"
+                f"• Time: {get_current_utc_time().strftime('%H:%M:%S')}"
             )
             
             await context.bot.send_message(
@@ -1004,7 +1036,7 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
             if withdrawals_col is not None:
                 withdrawals_col.update_one(
                     {"withdrawal_id": withdrawal_id},
-                    {"$set": {"status": "COMPLETED", "updated_at": datetime.utcnow()}}
+                    {"$set": {"status": "COMPLETED", "updated_at": get_current_utc_time()}}
                 )
             
             # Update user balance (deduct)
@@ -1016,7 +1048,7 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"• User: {withdrawal['user_id']}\n"
                 f"• Amount: ₹{withdrawal['amount']:.2f}\n"
                 f"• UPI ID: `{withdrawal['upi_id']}`\n"
-                f"• Time: {datetime.utcnow().strftime('%H:%M:%S')}"
+                f"• Time: {get_current_utc_time().strftime('%H:%M:%S')}"
             )
             
             await context.bot.send_message(
@@ -1064,12 +1096,12 @@ async def deposit_watcher(application):
     
     while True:
         try:
-            # FIXED: Proper None check for MongoDB collections
+            # Proper None check for MongoDB collections
             if deposits_col is None:
                 await asyncio.sleep(30)
                 continue
             
-            now = datetime.utcnow()
+            now = get_current_utc_time()
             
             # Check REQUESTED deposits (move to PENDING after timeout)
             requested_deposits = deposits_col.find({"status": "REQUESTED"})
@@ -1158,12 +1190,13 @@ async def post_init(application):
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle errors in the bot"""
-    logger.error(f"Update {update} caused error {context.error}")
+    logger.error(f"Error: {context.error}")
     
+    # Handle conflict error gracefully
     if isinstance(context.error, telegram.error.Conflict):
-        logger.error("CONFLICT ERROR: Another bot instance is running. This bot will stop.")
-        # Don't restart here, let the main loop handle it
-        raise context.error
+        logger.error("Conflict error: Another bot instance might be running. Waiting...")
+        await asyncio.sleep(10)
+        return
     
     try:
         # Try to notify user of error
@@ -1177,100 +1210,88 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Main function to start the bot"""
-    max_restarts = 5
-    restart_count = 0
+    # Add startup delay to prevent conflict with previous instance
+    logger.info("Starting bot with 5-second delay to avoid conflict...")
+    time.sleep(5)
     
-    while restart_count < max_restarts:
-        try:
-            # Create application
-            application = Application.builder().token(BOT_TOKEN).build()
-            
-            # Add error handler
-            application.add_error_handler(error_handler)
-            
-            # Conversation handler for deposit flow
-            conv_handler = ConversationHandler(
-                entry_points=[CommandHandler("start", start)],
-                states={
-                    MAIN_MENU: [
-                        CallbackQueryHandler(handle_callback_query, pattern="^(deposit|withdraw|balance|help)$"),
-                    ],
-                    DEPOSIT_SELECT_AMOUNT: [
-                        CallbackQueryHandler(handle_callback_query, pattern="^(amount_|proceed|cancel)"),
-                    ],
-                    DEPOSIT_WAIT_PAYMENT: [
-                        CallbackQueryHandler(handle_callback_query, pattern="^(payment_done|cancel)"),
-                    ],
-                    DEPOSIT_WAIT_SCREENSHOT: [
-                        MessageHandler(filters.PHOTO, handle_screenshot),
-                        CallbackQueryHandler(handle_callback_query, pattern="^cancel$"),
-                    ],
-                    DEPOSIT_WAIT_UTR: [
-                        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_utr),
-                        CallbackQueryHandler(handle_callback_query, pattern="^cancel$"),
-                    ],
-                    WITHDRAW_ENTER_UPI: [
-                        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_upi_id),
-                        CallbackQueryHandler(handle_callback_query, pattern="^cancel$"),
-                    ],
-                    WITHDRAW_ENTER_AMOUNT: [
-                        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_withdraw_amount),
-                        CallbackQueryHandler(handle_callback_query, pattern="^cancel$"),
-                    ],
-                    WITHDRAW_CONFIRM: [
-                        CallbackQueryHandler(handle_confirm_withdraw, pattern="^confirm_withdraw$"),
-                        CallbackQueryHandler(handle_callback_query, pattern="^cancel$"),
-                    ],
-                },
-                fallbacks=[
-                    CommandHandler("start", start),
-                    CommandHandler("help", help_command),
-                    MessageHandler(filters.ALL, handle_unknown_message)
+    try:
+        # Create application
+        application = Application.builder().token(BOT_TOKEN).build()
+        
+        # Add error handler
+        application.add_error_handler(error_handler)
+        
+        # Conversation handler for deposit flow
+        conv_handler = ConversationHandler(
+            entry_points=[CommandHandler("start", start)],
+            states={
+                MAIN_MENU: [
+                    CallbackQueryHandler(handle_callback_query, pattern="^(deposit|withdraw|balance|help)$"),
                 ],
-                allow_reentry=True
-            )
-            
-            # Add handlers
-            application.add_handler(conv_handler)
-            application.add_handler(CommandHandler("help", help_command))
-            application.add_handler(MessageHandler(
-                filters.User(ADMIN_ID) & filters.TEXT & ~filters.COMMAND,
-                handle_admin_message
-            ))
-            
-            # Set post initialization
-            application.post_init = post_init
-            
-            # Start polling
-            logger.info(f"Starting bot... (Attempt {restart_count + 1}/{max_restarts})")
-            application.run_polling(
-                drop_pending_updates=True,
-                allowed_updates=Update.ALL_TYPES,
-                close_loop=False
-            )
-            
-            # If we get here, polling stopped without error
-            break
-            
-        except telegram.error.Conflict as e:
-            logger.error(f"CONFLICT ERROR: {e}")
-            restart_count += 1
-            if restart_count < max_restarts:
-                logger.info(f"Waiting 10 seconds before restart {restart_count}...")
-                time.sleep(10)
-            else:
-                logger.error("Max restart attempts reached. Bot will not restart.")
-                break
-                
-        except Exception as e:
-            logger.error(f"Unexpected error: {e}")
-            restart_count += 1
-            if restart_count < max_restarts:
-                logger.info(f"Waiting 5 seconds before restart {restart_count}...")
-                time.sleep(5)
-            else:
-                logger.error("Max restart attempts reached. Bot will not restart.")
-                break
+                DEPOSIT_SELECT_AMOUNT: [
+                    CallbackQueryHandler(handle_callback_query, pattern="^(amount_|proceed|cancel)"),
+                ],
+                DEPOSIT_WAIT_PAYMENT: [
+                    CallbackQueryHandler(handle_callback_query, pattern="^(payment_done|cancel)"),
+                ],
+                DEPOSIT_WAIT_SCREENSHOT: [
+                    MessageHandler(filters.PHOTO, handle_screenshot),
+                    CallbackQueryHandler(handle_callback_query, pattern="^cancel$"),
+                ],
+                DEPOSIT_WAIT_UTR: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_utr),
+                    CallbackQueryHandler(handle_callback_query, pattern="^cancel$"),
+                ],
+                WITHDRAW_ENTER_UPI: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_upi_id),
+                    CallbackQueryHandler(handle_callback_query, pattern="^cancel$"),
+                ],
+                WITHDRAW_ENTER_AMOUNT: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_withdraw_amount),
+                    CallbackQueryHandler(handle_callback_query, pattern="^cancel$"),
+                ],
+                WITHDRAW_CONFIRM: [
+                    CallbackQueryHandler(handle_confirm_withdraw, pattern="^confirm_withdraw$"),
+                    CallbackQueryHandler(handle_callback_query, pattern="^cancel$"),
+                ],
+            },
+            fallbacks=[
+                CommandHandler("start", start),
+                CommandHandler("help", help_command),
+                MessageHandler(filters.ALL, handle_unknown_message)
+            ],
+            allow_reentry=True,
+            per_message=True
+        )
+        
+        # Add handlers
+        application.add_handler(conv_handler)
+        application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(MessageHandler(
+            filters.User(ADMIN_ID) & filters.TEXT & ~filters.COMMAND,
+            handle_admin_message
+        ))
+        
+        # Set post initialization
+        application.post_init = post_init
+        
+        # Start polling
+        logger.info("Bot starting polling...")
+        application.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
+            close_loop=False,
+            pool_timeout=30
+        )
+        
+    except telegram.error.Conflict as e:
+        logger.error(f"CONFLICT ERROR during startup: {e}")
+        logger.info("Waiting 15 seconds before possible restart...")
+        time.sleep(15)
+        
+    except Exception as e:
+        logger.error(f"Fatal error starting bot: {e}")
+        logger.info("Bot will exit. Check logs for details.")
 
 if __name__ == "__main__":
     main()
