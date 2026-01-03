@@ -1,5 +1,5 @@
 services:
-  - type: worker
+  - type: worker  # <-- THIS MUST BE "worker" not "web"
     name: telegram-payment-bot
     env: python
     region: oregon
