@@ -71,6 +71,9 @@ def init_db():
 
 users_col, deposits_col, withdrawals_col, mongo_client = init_db()
 
+# Check if database is connected
+DB_CONNECTED = all([users_col, deposits_col, withdrawals_col])
+
 # ================= CONSTANTS =================
 UTR_REGEX = r"^\d{12,18}$"
 UPI_REGEX = r"^[\w\.\-]{3,256}@[\w]{3,64}$"
@@ -124,7 +127,7 @@ def get_deposit_cancel_keyboard(request_id=None):
 # ================= USER MANAGEMENT =================
 def get_or_create_user(telegram_id: int, username: str = None):
     """Get or create user"""
-    if users_col is None:
+    if not DB_CONNECTED:
         return {
             "telegram_id": telegram_id,
             "username": username,
@@ -147,7 +150,8 @@ def get_or_create_user(telegram_id: int, username: str = None):
             }
             users_col.insert_one(user)
         return user
-    except:
+    except Exception as e:
+        logger.error(f"Error getting/creating user: {e}")
         return {
             "telegram_id": telegram_id,
             "username": username,
@@ -158,7 +162,7 @@ def get_or_create_user(telegram_id: int, username: str = None):
 
 def update_user_balance(telegram_id: int, amount: float, is_deposit: bool = True):
     """Update user balance"""
-    if users_col is None:
+    if not DB_CONNECTED:
         return False
     
     try:
@@ -173,7 +177,8 @@ def update_user_balance(telegram_id: int, amount: float, is_deposit: bool = True
                 {"$inc": {"balance": -amount, "total_withdrawals": amount}}
             )
         return True
-    except:
+    except Exception as e:
+        logger.error(f"Error updating user balance: {e}")
         return False
 
 # ================= COMMANDS =================
@@ -258,6 +263,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         balance = user.get('balance', 0)
         total_deposits = user.get('total_deposits', 0)
         total_withdrawals = user.get('total_withdrawals', 0)
+        created_at = user.get('created_at', 'N/A')
+        if created_at != 'N/A':
+            created_at = created_at.strftime("%Y-%m-%d %H:%M:%S")
         
         info_text = (
             f"👤 *User Information*\n\n"
@@ -267,7 +275,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             f"• Available Balance: ₹{balance:.0f}\n"
             f"• Total Deposits: ₹{total_deposits:.0f}\n"
             f"• Total Withdrawals: ₹{total_withdrawals:.0f}\n"
-            f"• Account Created: {user.get('created_at', 'N/A')}"
+            f"• Account Created: {created_at}"
         )
         
         await query.edit_message_text(
@@ -292,7 +300,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     
     elif data.startswith("cancel_deposit_"):
         request_id = data.split("_")[-1]
-        if deposits_col:
+        if DB_CONNECTED:
             deposit = deposits_col.find_one({"request_id": request_id, "user_id": user_id})
             if deposit and deposit["status"] in ["REQUESTED", "PENDING"]:
                 deposits_col.update_one(
@@ -416,7 +424,7 @@ async def handle_utr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = update.effective_user.username or "N/A"
     
     # Save to database
-    if deposits_col:
+    if DB_CONNECTED:
         try:
             deposits_col.insert_one({
                 "request_id": request_id,
@@ -574,7 +582,7 @@ async def handle_confirm_withdraw_callback(update: Update, context: ContextTypes
     withdrawal_id = str(uuid.uuid4())[:8]
     
     # Save withdrawal
-    if withdrawals_col:
+    if DB_CONNECTED:
         try:
             withdrawals_col.insert_one({
                 "withdrawal_id": withdrawal_id,
@@ -638,12 +646,12 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
             
             # Find deposit
             deposit = None
-            if deposits_col:
+            if DB_CONNECTED:
                 deposit = deposits_col.find_one({"utr": utr, "status": {"$in": ["REQUESTED", "PENDING"]}})
             
             if deposit:
                 # Update status
-                if deposits_col:
+                if DB_CONNECTED:
                     deposits_col.update_one(
                         {"utr": utr},
                         {"$set": {"status": "COMPLETED", "completed_at": datetime.now(timezone.utc)}}
@@ -699,7 +707,7 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 return
             
             deposit = None
-            if deposits_col:
+            if DB_CONNECTED:
                 deposit = deposits_col.find_one({"request_id": request_id})
             
             if deposit:
@@ -742,7 +750,7 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 return
             
             withdrawal = None
-            if withdrawals_col:
+            if DB_CONNECTED:
                 withdrawal = withdrawals_col.find_one({
                     "withdrawal_id": withdrawal_id,
                     "status": "REQUESTED"
@@ -750,7 +758,7 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
             
             if withdrawal:
                 # Update status
-                if withdrawals_col:
+                if DB_CONNECTED:
                     withdrawals_col.update_one(
                         {"withdrawal_id": withdrawal_id},
                         {"$set": {"status": "COMPLETED", "processed_at": datetime.now(timezone.utc)}}
@@ -806,7 +814,7 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 return
             
             withdrawal = None
-            if withdrawals_col:
+            if DB_CONNECTED:
                 withdrawal = withdrawals_col.find_one({
                     "withdrawal_id": withdrawal_id,
                     "status": "REQUESTED"
@@ -848,7 +856,7 @@ async def deposit_reminder_task(application):
     
     while True:
         try:
-            if deposits_col:
+            if DB_CONNECTED:
                 now = datetime.now(timezone.utc)
                 
                 # Find pending deposits
@@ -889,8 +897,8 @@ async def deposit_reminder_task(application):
                                 f"Confirm: `/confirm {deposit.get('utr', '')}`",
                                 parse_mode='Markdown'
                             )
-                        except:
-                            pass
+                        except Exception as e:
+                            logger.error(f"Error sending reminder: {e}")
                         
                         # Auto-cancel after MAX_REMINDERS
                         if reminder_count >= MAX_REMINDERS:
@@ -911,8 +919,8 @@ async def deposit_reminder_task(application):
                                     reply_markup=get_main_menu_keyboard(),
                                     parse_mode='Markdown'
                                 )
-                            except:
-                                pass
+                            except Exception as e:
+                                logger.error(f"Error notifying user of auto-cancellation: {e}")
                             
                             # Notify admin
                             try:
@@ -944,6 +952,7 @@ def main():
     logger.info("=" * 50)
     logger.info("Starting Telegram Payment Bot")
     logger.info(f"Admin: {ADMIN_ID}")
+    logger.info(f"Database Connected: {DB_CONNECTED}")
     logger.info("=" * 50)
     
     # Add startup delay to avoid conflict
@@ -994,7 +1003,8 @@ def main():
                 CommandHandler("start", start),
                 CommandHandler("help", help_command),
             ],
-            allow_reentry=True
+            allow_reentry=True,
+            per_message=True  # Fix the PTBUserWarning
         )
         
         # Add handlers
@@ -1011,6 +1021,14 @@ def main():
         # Add error handler
         async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Update {update} caused error {context.error}")
+            if update and update.effective_chat:
+                try:
+                    await context.bot.send_message(
+                        update.effective_chat.id,
+                        "❌ An error occurred. Please try again."
+                    )
+                except:
+                    pass
         
         app.add_error_handler(error_handler)
         
