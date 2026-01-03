@@ -44,7 +44,13 @@ logger = logging.getLogger(__name__)
 
 # ================= DATABASE SETUP =================
 try:
-    client = MongoClient(MONGO_URI)
+    client = MongoClient(
+        MONGO_URI,
+        serverSelectionTimeoutMS=15000,
+        connectTimeoutMS=15000,
+        socketTimeoutMS=15000
+    )
+    client.admin.command('ping')
     db = client.telegram_payment_bot
     users_col = db.users
     deposits_col = db.deposits
@@ -58,7 +64,10 @@ try:
     logger.info("Database connection established successfully")
 except PyMongoError as e:
     logger.error(f"Database connection failed: {e}")
-    raise
+    # Continue without database (fallback mode)
+    users_col = None
+    deposits_col = None
+    withdrawals_col = None
 
 # ================= CONSTANTS =================
 UTR_REGEX = r"^\d{12,18}$"
@@ -131,6 +140,18 @@ def get_cancel_keyboard():
 # ================= USER MANAGEMENT =================
 def get_or_create_user(telegram_id: int, username: str = None):
     """Get user from DB or create if not exists"""
+    if not users_col:
+        # Fallback without database
+        return {
+            "telegram_id": telegram_id,
+            "username": username,
+            "uid": str(uuid.uuid4())[:8],
+            "balance": 0.0,
+            "total_deposits": 0.0,
+            "total_withdrawals": 0.0,
+            "created_at": datetime.utcnow()
+        }
+    
     try:
         user = users_col.find_one_and_update(
             {"telegram_id": telegram_id},
@@ -154,6 +175,9 @@ def get_or_create_user(telegram_id: int, username: str = None):
 
 def update_user_balance(telegram_id: int, amount: float, is_deposit: bool = True):
     """Update user balance after deposit/withdrawal"""
+    if not users_col:
+        return False
+    
     try:
         update_data = {
             "$inc": {"balance": amount},
@@ -363,7 +387,7 @@ async def handle_amount_selection(query, context):
     return DEPOSIT_SELECT_AMOUNT
 
 async def handle_proceed(query, context, user):
-    """Handle proceed to payment"""
+    """Handle proceed to payment - SHOWS QR CODE"""
     selected_amounts = context.user_data.get("selected_amounts", [])
     
     if not selected_amounts:
@@ -384,35 +408,39 @@ async def handle_proceed(query, context, user):
         "user_uid": user.get("uid", "N/A")
     }
     
-    # In production, you would use a real QR code image
-    # For now, we'll use a placeholder message
-    payment_text = (
-        f"💳 *Payment Instructions*\n\n"
-        f"Amount: ₹{total_amount}\n\n"
-        f"1. Pay ₹{total_amount} to the merchant\n"
-        f"2. Keep the payment screenshot ready\n"
-        f"3. Note down the UTR number (12-18 digits)\n"
-        f"4. Click '✅ Payment Done' after payment\n\n"
-        f"⚠️ Do not click until payment is completed!"
-    )
-    
-    await query.edit_message_text(
-        payment_text,
-        reply_markup=get_payment_done_keyboard(),
-        parse_mode='Markdown'
-    )
+    # Show QR code image
+    try:
+        with open("qr.jpg", "rb") as qr_file:
+            await query.message.reply_photo(
+                photo=qr_file,
+                caption=f"💳 *Pay ₹{total_amount}*\n\nClick '✅ Payment Done' after payment",
+                reply_markup=get_payment_done_keyboard(),
+                parse_mode='Markdown'
+            )
+    except FileNotFoundError:
+        # Fallback if QR file is missing
+        payment_text = (
+            f"💳 *Pay ₹{total_amount}*\n\n"
+            f"1. Pay ₹{total_amount} to merchant\n"
+            f"2. Click '✅ Payment Done' after payment\n\n"
+            f"⚠️ Do not click until payment is completed!"
+        )
+        await query.edit_message_text(
+            payment_text,
+            reply_markup=get_payment_done_keyboard(),
+            parse_mode='Markdown'
+        )
     
     return DEPOSIT_WAIT_PAYMENT
 
 async def handle_payment_done(query, context):
     """Handle payment done button"""
     await query.edit_message_text(
-        "📸 *Step 1: Send Screenshot*\n\n"
-        "Please send the payment confirmation screenshot.\n"
-        "Make sure it clearly shows:\n"
-        "• Payment amount\n"
-        "• Transaction details\n"
-        "• Timestamp",
+        "📤 *Send Payment Proof*\n\n"
+        "Please send:\n"
+        "1. Payment screenshot\n"
+        "2. UTR number (12-18 digits)\n\n"
+        "Send screenshot first, then UTR in next message.",
         reply_markup=get_cancel_keyboard(),
         parse_mode='Markdown'
     )
@@ -447,7 +475,7 @@ async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await update.message.reply_text(
             "✅ Screenshot received!\n\n"
-            "📝 *Step 2: Send UTR Number*\n\n"
+            "📝 *Now send UTR Number*\n\n"
             "Please enter the UTR number (12-18 digits):",
             reply_markup=get_cancel_keyboard(),
             parse_mode='Markdown'
@@ -476,14 +504,15 @@ async def handle_utr(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return DEPOSIT_WAIT_UTR
     
     # Check if UTR already exists
-    existing = deposits_col.find_one({"utr": utr})
-    if existing:
-        await update.message.reply_text(
-            "❌ This UTR has already been submitted.\n"
-            "Please contact admin if this is an error.",
-            reply_markup=get_main_menu_keyboard()
-        )
-        return MAIN_MENU
+    if deposits_col:
+        existing = deposits_col.find_one({"utr": utr})
+        if existing:
+            await update.message.reply_text(
+                "❌ This UTR has already been submitted.\n"
+                "Please contact admin if this is an error.",
+                reply_markup=get_main_menu_keyboard()
+            )
+            return MAIN_MENU
     
     # Get deposit info
     deposit_info = context.user_data.get("deposit_info", {})
@@ -515,31 +544,29 @@ async def handle_utr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         # Insert deposit record
-        deposits_col.insert_one(deposit_record)
+        if deposits_col:
+            deposits_col.insert_one(deposit_record)
         
-        # Send notification to admin group
-        admin_text = (
-            f"🟡 *NEW DEPOSIT REQUEST*\n\n"
-            f"• Deposit ID: `{deposit_id}`\n"
-            f"• User: {deposit_info['user_id']}\n"
-            f"• UID: `{deposit_info['user_uid']}`\n"
-            f"• Amount: ₹{amount}\n"
-            f"• UTR: `{utr}`\n\n"
-            f"To confirm, reply:\n"
-            f"`CONFIRM {utr}`"
-        )
-        
-        msg = await context.bot.send_message(
-            DEPOSIT_REQUESTS_GROUP_ID,
-            admin_text,
-            parse_mode='Markdown'
-        )
-        
-        # Update with message ID
-        deposits_col.update_one(
-            {"deposit_id": deposit_id},
-            {"$set": {"admin_msg_id": msg.message_id}}
-        )
+        # Send screenshot to admin group
+        screenshot_id = context.user_data.get("screenshot_id", "")
+        if screenshot_id:
+            try:
+                await context.bot.send_photo(
+                    DEPOSIT_REQUESTS_GROUP_ID,
+                    photo=screenshot_id,
+                    caption=f"🟡 NEW DEPOSIT\n\nUser: {deposit_info['user_id']}\nAmount: ₹{amount}\nUTR: {utr}\n\nReply: CONFIRM {utr}"
+                )
+            except:
+                # Send text if photo fails
+                await context.bot.send_message(
+                    DEPOSIT_REQUESTS_GROUP_ID,
+                    f"🟡 NEW DEPOSIT\n\nUser: {deposit_info['user_id']}\nAmount: ₹{amount}\nUTR: {utr}\n\nReply: CONFIRM {utr}"
+                )
+        else:
+            await context.bot.send_message(
+                DEPOSIT_REQUESTS_GROUP_ID,
+                f"🟡 NEW DEPOSIT\n\nUser: {deposit_info['user_id']}\nAmount: ₹{amount}\nUTR: {utr}\n\nReply: CONFIRM {utr}"
+            )
         
         # Notify user
         await update.message.reply_text(
@@ -555,10 +582,10 @@ async def handle_utr(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Clear user data
         context.user_data.clear()
         
-    except PyMongoError as e:
+    except Exception as e:
         logger.error(f"Error creating deposit: {e}")
         await update.message.reply_text(
-            "❌ Database error. Please try again.",
+            "❌ An error occurred. Please try again.",
             reply_markup=get_main_menu_keyboard()
         )
     
@@ -695,7 +722,8 @@ async def handle_confirm_withdraw(update: Update, context: ContextTypes.DEFAULT_
     
     try:
         # Insert withdrawal record
-        withdrawals_col.insert_one(withdrawal_record)
+        if withdrawals_col:
+            withdrawals_col.insert_one(withdrawal_record)
         
         # Send notification to admin group
         admin_text = (
@@ -709,17 +737,26 @@ async def handle_confirm_withdraw(update: Update, context: ContextTypes.DEFAULT_
             f"`DONE {withdrawal_id}`"
         )
         
-        msg = await context.bot.send_message(
-            WITHDRAW_REQUESTS_GROUP_ID,
-            admin_text,
-            parse_mode='Markdown'
-        )
-        
-        # Update with message ID
-        withdrawals_col.update_one(
-            {"withdrawal_id": withdrawal_id},
-            {"$set": {"admin_msg_id": msg.message_id}}
-        )
+        # Try to send to withdraw group, fallback to admin
+        try:
+            msg = await context.bot.send_message(
+                WITHDRAW_REQUESTS_GROUP_ID,
+                admin_text,
+                parse_mode='Markdown'
+            )
+            # Update with message ID
+            if withdrawals_col:
+                withdrawals_col.update_one(
+                    {"withdrawal_id": withdrawal_id},
+                    {"$set": {"admin_msg_id": msg.message_id}}
+                )
+        except:
+            # Send to admin directly if group doesn't exist
+            await context.bot.send_message(
+                ADMIN_ID,
+                admin_text,
+                parse_mode='Markdown'
+            )
         
         # Notify user
         await query.edit_message_text(
@@ -735,40 +772,51 @@ async def handle_confirm_withdraw(update: Update, context: ContextTypes.DEFAULT_
         # Clear user data
         context.user_data.clear()
         
-    except PyMongoError as e:
+    except Exception as e:
         logger.error(f"Error creating withdrawal: {e}")
         await query.edit_message_text(
-            "❌ Database error. Please try again.",
+            "❌ An error occurred. Please try again.",
             reply_markup=get_main_menu_keyboard()
         )
     
     return MAIN_MENU
 
 async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle admin commands"""
+    """Handle admin commands - FIXED CONFIRM LOGIC"""
     if update.effective_user.id != ADMIN_ID:
         return
     
     text = update.message.text.strip().upper()
     
     # Handle deposit confirmation
-    if text.startswith("CONFIRM "):
-        utr = text.split()[1]
+    if text.startswith("CONFIRM"):
+        # Extract UTR from message
+        parts = text.split()
+        if len(parts) >= 2:
+            utr = parts[1]  # "CONFIRM 123456"
+        elif len(text) > 7:
+            utr = text[7:].strip()  # "CONFIRM123456"
+        else:
+            await update.message.reply_text("❌ Format: CONFIRM UTR")
+            return
         
         # Find deposit
-        deposit = deposits_col.find_one({"utr": utr, "status": {"$in": ["REQUESTED", "PENDING"]}})
+        deposit = None
+        if deposits_col:
+            deposit = deposits_col.find_one({"utr": utr, "status": {"$in": ["REQUESTED", "PENDING"]}})
+        
         if not deposit:
             await update.message.reply_text(f"❌ Deposit not found or already processed.")
             return
         
         # Delete message from current group
         try:
-            if deposit["status"] == "REQUESTED":
+            if deposit.get("status") == "REQUESTED":
                 await context.bot.delete_message(
                     DEPOSIT_REQUESTS_GROUP_ID,
                     deposit.get("admin_msg_id")
                 )
-            elif deposit["status"] == "PENDING":
+            elif deposit.get("status") == "PENDING":
                 await context.bot.delete_message(
                     DEPOSIT_PENDING_GROUP_ID,
                     deposit.get("admin_msg_id")
@@ -777,10 +825,11 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
             logger.warning(f"Could not delete message: {e}")
         
         # Update deposit status
-        deposits_col.update_one(
-            {"utr": utr},
-            {"$set": {"status": "COMPLETED", "updated_at": datetime.utcnow()}}
-        )
+        if deposits_col:
+            deposits_col.update_one(
+                {"utr": utr},
+                {"$set": {"status": "COMPLETED", "updated_at": datetime.utcnow()}}
+            )
         
         # Update user balance
         update_user_balance(deposit["user_id"], deposit["amount"], is_deposit=True)
@@ -788,12 +837,10 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
         # Send to completed group
         completed_text = (
             f"✅ *DEPOSIT COMPLETED*\n\n"
-            f"• Deposit ID: `{deposit.get('deposit_id')}`\n"
             f"• User: {deposit['user_id']}\n"
-            f"• UID: `{deposit.get('user_uid')}`\n"
             f"• Amount: ₹{deposit['amount']}\n"
             f"• UTR: `{utr}`\n"
-            f"• Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
+            f"• Time: {datetime.utcnow().strftime('%H:%M:%S')}"
         )
         
         await context.bot.send_message(
@@ -816,14 +863,24 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(f"✅ Deposit confirmed for UTR: {utr}")
     
     # Handle withdrawal completion
-    elif text.startswith("DONE "):
-        withdrawal_id = text.split()[1]
+    elif text.startswith("DONE"):
+        # Extract withdrawal ID
+        parts = text.split()
+        if len(parts) >= 2:
+            withdrawal_id = parts[1]
+        elif len(text) > 4:
+            withdrawal_id = text[4:].strip()
+        else:
+            await update.message.reply_text("❌ Format: DONE WITHDRAWAL_ID")
+            return
         
         # Find withdrawal
-        withdrawal = withdrawals_col.find_one({
-            "withdrawal_id": withdrawal_id,
-            "status": "REQUESTED"
-        })
+        withdrawal = None
+        if withdrawals_col:
+            withdrawal = withdrawals_col.find_one({
+                "withdrawal_id": withdrawal_id,
+                "status": "REQUESTED"
+            })
         
         if not withdrawal:
             await update.message.reply_text(f"❌ Withdrawal not found or already processed.")
@@ -839,10 +896,11 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
             logger.warning(f"Could not delete message: {e}")
         
         # Update withdrawal status
-        withdrawals_col.update_one(
-            {"withdrawal_id": withdrawal_id},
-            {"$set": {"status": "COMPLETED", "updated_at": datetime.utcnow()}}
-        )
+        if withdrawals_col:
+            withdrawals_col.update_one(
+                {"withdrawal_id": withdrawal_id},
+                {"$set": {"status": "COMPLETED", "updated_at": datetime.utcnow()}}
+            )
         
         # Update user balance (deduct)
         update_user_balance(withdrawal["user_id"], -withdrawal["amount"], is_deposit=False)
@@ -850,12 +908,10 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
         # Send to completed group
         completed_text = (
             f"✅ *WITHDRAWAL COMPLETED*\n\n"
-            f"• Withdrawal ID: `{withdrawal_id}`\n"
             f"• User: {withdrawal['user_id']}\n"
-            f"• UID: `{withdrawal.get('user_uid')}`\n"
             f"• Amount: ₹{withdrawal['amount']:.2f}\n"
             f"• UPI ID: `{withdrawal['upi_id']}`\n"
-            f"• Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
+            f"• Time: {datetime.utcnow().strftime('%H:%M:%S')}"
         )
         
         await context.bot.send_message(
@@ -893,6 +949,10 @@ async def deposit_watcher(application):
     
     while True:
         try:
+            if not deposits_col:
+                await asyncio.sleep(30)
+                continue
+            
             now = datetime.utcnow()
             
             # Check REQUESTED deposits (move to PENDING after timeout)
@@ -914,12 +974,10 @@ async def deposit_watcher(application):
                     # Send to pending group
                     pending_text = (
                         f"🟠 *DEPOSIT PENDING*\n\n"
-                        f"• Deposit ID: `{deposit.get('deposit_id')}`\n"
                         f"• User: {deposit['user_id']}\n"
-                        f"• UID: `{deposit.get('user_uid')}`\n"
                         f"• Amount: ₹{deposit['amount']}\n"
                         f"• UTR: `{deposit['utr']}`\n"
-                        f"• Pending since: {deposit['created_at'].strftime('%H:%M:%S')}"
+                        f"• Waiting for: {int(time_diff/60)} minutes"
                     )
                     
                     msg = await application.bot.send_message(
@@ -939,7 +997,7 @@ async def deposit_watcher(application):
                         }}
                     )
                     
-                    logger.info(f"Moved deposit {deposit.get('deposit_id')} to PENDING")
+                    logger.info(f"Moved deposit UTR {deposit['utr']} to PENDING")
             
             # Send reminders for PENDING deposits
             pending_deposits = deposits_col.find({"status": "PENDING"})
@@ -953,7 +1011,7 @@ async def deposit_watcher(application):
                         f"• UTR: `{deposit['utr']}`\n"
                         f"• Amount: ₹{deposit['amount']}\n"
                         f"• User: {deposit['user_id']}\n"
-                        f"• Waiting for: {int((now - deposit['created_at']).total_seconds() / 60)} minutes"
+                        f"• Waiting: {int((now - deposit['created_at']).total_seconds() / 60)} min"
                     )
                     
                     await application.bot.send_message(
