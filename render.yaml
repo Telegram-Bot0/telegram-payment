@@ -2,12 +2,12 @@ services:
   - type: web
     name: telegram-payment-bot
     env: python
-    region: oregon  # or singapore, frankfurt, etc.
+    region: oregon
     plan: free
     autoDeploy: true
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
-    healthCheckPath: /health
+    # NO health check to avoid port conflicts
     envVars:
       - key: BOT_TOKEN
         value: "7998689373:AAGUaTxrHzWabJvqZAUM2NjRQb1PHXpmGqA"
@@ -24,4 +24,4 @@ services:
       - key: WITHDRAW_COMPLETED_GROUP_ID
         value: "-1003637541728"
       - key: MONGO_URI
-        value: "mongodb+srv://telegram-payment-bot:Jatin161@telegram-payment-bot.cabji2f.mongodb.net/?retryWrites=true&w=majority&serverSelectionTimeoutMS=10000&connectTimeoutMS=10000&socketTimeoutMS=10000"
+        value: "mongodb+srv://telegram-payment-bot:Jatin161@telegram-payment-bot.cabji2f.mongodb.net/?retryWrites=true&w=majority&serverSelectionTimeoutMS=10000&connectTimeoutMS=10000"
