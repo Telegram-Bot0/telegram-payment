@@ -19,7 +19,7 @@ DEPOSIT_PENDING_GROUP    = -5266076639
 DEPOSIT_COMPLETED_GROUP  = -5204290005
 
 # ================= SETTINGS =================
-UTR_REGEX = r"^\d{12,18}$"   # strict numeric UTR
+UTR_REGEX = r"^\d{12,18}$"
 REQUEST_TIMEOUT = 120        # 2 minutes
 PENDING_REMINDER = 60        # 1 minute
 
@@ -157,7 +157,7 @@ async def deposit_watcher(app):
     while True:
         now = time.time()
 
-        # MOVE REQUEST → PENDING
+        # REQUEST → PENDING
         for d in deposits.find({"status": "REQUESTED"}):
             if now - d["created_at"] > REQUEST_TIMEOUT:
                 try:
@@ -184,7 +184,7 @@ async def deposit_watcher(app):
                     }}
                 )
 
-        # REMINDER FOR PENDING
+        # PENDING REMINDER
         for d in deposits.find({"status": "PENDING"}):
             if now - d["last_reminder"] > PENDING_REMINDER:
                 await app.bot.send_message(
@@ -198,12 +198,13 @@ async def deposit_watcher(app):
 
         await asyncio.sleep(30)
 
-# ================= STARTUP HOOK =================
-async def on_startup(app):
+# ================= POST INIT (PTB v21 CORRECT WAY) =================
+async def post_init(app):
     app.create_task(deposit_watcher(app))
 
 # ================= MAIN =================
 app = ApplicationBuilder().token(BOT_TOKEN).build()
+app.post_init = post_init
 
 app.add_handler(CommandHandler("start", start))
 app.add_handler(MessageHandler(filters.User(ADMIN_ID) & filters.TEXT, admin_handler))
@@ -211,6 +212,5 @@ app.add_handler(MessageHandler(filters.PHOTO | filters.TEXT, user_input))
 
 app.run_polling(
     drop_pending_updates=True,
-    close_loop=False,
-    on_startup=on_startup
+    close_loop=False
 )
