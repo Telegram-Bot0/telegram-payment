@@ -23,6 +23,7 @@ from telegram.ext import (
 )
 from pymongo import MongoClient, ReturnDocument
 from pymongo.errors import PyMongoError
+import telegram.error
 
 from config import (
     BOT_TOKEN,
@@ -43,31 +44,44 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ================= DATABASE SETUP =================
-try:
-    client = MongoClient(
-        MONGO_URI,
-        serverSelectionTimeoutMS=15000,
-        connectTimeoutMS=15000,
-        socketTimeoutMS=15000
-    )
-    client.admin.command('ping')
-    db = client.telegram_payment_bot
-    users_col = db.users
-    deposits_col = db.deposits
-    withdrawals_col = db.withdrawals
-    
-    # Create indexes
-    users_col.create_index("telegram_id", unique=True)
-    deposits_col.create_index("utr", unique=True)
-    deposits_col.create_index("status")
-    withdrawals_col.create_index("status")
-    logger.info("Database connection established successfully")
-except PyMongoError as e:
-    logger.error(f"Database connection failed: {e}")
-    # Continue without database (fallback mode)
-    users_col = None
-    deposits_col = None
-    withdrawals_col = None
+def initialize_database():
+    """Initialize database connection with retry logic"""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            client = MongoClient(
+                MONGO_URI,
+                serverSelectionTimeoutMS=15000,
+                connectTimeoutMS=15000,
+                socketTimeoutMS=15000,
+                maxPoolSize=10,
+                minPoolSize=1
+            )
+            client.admin.command('ping')
+            db = client.telegram_payment_bot
+            users_col = db.users
+            deposits_col = db.deposits
+            withdrawals_col = db.withdrawals
+            
+            # Create indexes
+            users_col.create_index("telegram_id", unique=True)
+            deposits_col.create_index("utr", unique=True)
+            deposits_col.create_index("status")
+            withdrawals_col.create_index("status")
+            
+            logger.info("Database connection established successfully")
+            return users_col, deposits_col, withdrawals_col, client
+            
+        except PyMongoError as e:
+            logger.warning(f"Database connection attempt {attempt + 1} failed: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(2)
+            else:
+                logger.error("All database connection attempts failed. Running in fallback mode.")
+                return None, None, None, None
+
+# Initialize database
+users_col, deposits_col, withdrawals_col, mongo_client = initialize_database()
 
 # ================= CONSTANTS =================
 UTR_REGEX = r"^\d{12,18}$"
@@ -140,7 +154,7 @@ def get_cancel_keyboard():
 # ================= USER MANAGEMENT =================
 def get_or_create_user(telegram_id: int, username: str = None):
     """Get user from DB or create if not exists"""
-    if not users_col:
+    if users_col is None:
         # Fallback without database
         return {
             "telegram_id": telegram_id,
@@ -169,13 +183,21 @@ def get_or_create_user(telegram_id: int, username: str = None):
             return_document=ReturnDocument.AFTER
         )
         return user
-    except PyMongoError as e:
+    except Exception as e:
         logger.error(f"Error getting/creating user {telegram_id}: {e}")
-        return None
+        return {
+            "telegram_id": telegram_id,
+            "username": username,
+            "uid": str(uuid.uuid4())[:8],
+            "balance": 0.0,
+            "total_deposits": 0.0,
+            "total_withdrawals": 0.0,
+            "created_at": datetime.utcnow()
+        }
 
 def update_user_balance(telegram_id: int, amount: float, is_deposit: bool = True):
     """Update user balance after deposit/withdrawal"""
-    if not users_col:
+    if users_col is None:
         return False
     
     try:
@@ -194,165 +216,202 @@ def update_user_balance(telegram_id: int, amount: float, is_deposit: bool = True
             update_data
         )
         return True
-    except PyMongoError as e:
+    except Exception as e:
         logger.error(f"Error updating balance for user {telegram_id}: {e}")
         return False
 
 # ================= COMMAND HANDLERS =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
-    user = update.effective_user
-    
-    # Store user in database
-    get_or_create_user(user.id, user.username)
-    
-    # Send welcome message with main menu
-    welcome_text = (
-        "🤖 *Payment Bot*\n\n"
-        "Welcome! Use the menu below to manage your payments.\n\n"
-        "💰 *Deposit* - Add funds to your account\n"
-        "💸 *Withdraw* - Withdraw funds to your UPI\n"
-        "📊 *Balance* - Check your current balance\n"
-        "ℹ️ *Help* - Get assistance\n"
-    )
-    
-    await update.message.reply_text(
-        welcome_text,
-        reply_markup=get_main_menu_keyboard(),
-        parse_mode='Markdown'
-    )
-    
-    return MAIN_MENU
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /help command"""
-    help_text = (
-        "📚 *Help Guide*\n\n"
-        "• *Deposit Process:*\n"
-        "  1. Select Deposit → Choose amount(s)\n"
-        "  2. View QR code and make payment\n"
-        "  3. Click 'Payment Done'\n"
-        "  4. Send payment screenshot\n"
-        "  5. Send UTR number (12-18 digits)\n\n"
+    try:
+        user = update.effective_user
         
-        "• *Withdraw Process:*\n"
-        "  1. Select Withdraw\n"
-        "  2. Enter your UPI ID\n"
-        "  3. Enter withdrawal amount\n"
-        "  4. Submit for admin approval\n\n"
+        # Store user in database
+        get_or_create_user(user.id, user.username)
         
-        "• *UTR Number:*\n"
-        "  A 12-18 digit number from your payment receipt\n\n"
+        # Send welcome message with main menu
+        welcome_text = (
+            "🤖 *Payment Bot*\n\n"
+            "Welcome! Use the menu below to manage your payments.\n\n"
+            "💰 *Deposit* - Add funds to your account\n"
+            "💸 *Withdraw* - Withdraw funds to your UPI\n"
+            "📊 *Balance* - Check your current balance\n"
+            "ℹ️ *Help* - Get assistance\n"
+        )
         
-        "⚠️ *Important:*\n"
-        "• Always use official payment methods\n"
-        "• Keep screenshots for reference\n"
-        "• Admin approval required for all transactions\n"
-    )
-    
-    if update.message:
-        await update.message.reply_text(help_text, parse_mode='Markdown')
-    else:
-        await update.callback_query.edit_message_text(
-            help_text,
+        await update.message.reply_text(
+            welcome_text,
             reply_markup=get_main_menu_keyboard(),
             parse_mode='Markdown'
         )
-    
-    return MAIN_MENU
+        
+        return MAIN_MENU
+    except Exception as e:
+        logger.error(f"Error in start command: {e}")
+        await update.message.reply_text(
+            "❌ An error occurred. Please try again.",
+            reply_markup=get_main_menu_keyboard()
+        )
+        return MAIN_MENU
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /help command"""
+    try:
+        help_text = (
+            "📚 *Help Guide*\n\n"
+            "• *Deposit Process:*\n"
+            "  1. Select Deposit → Choose amount(s)\n"
+            "  2. View QR code and make payment\n"
+            "  3. Click 'Payment Done'\n"
+            "  4. Send payment screenshot\n"
+            "  5. Send UTR number (12-18 digits)\n\n"
+            
+            "• *Withdraw Process:*\n"
+            "  1. Select Withdraw\n"
+            "  2. Enter your UPI ID\n"
+            "  3. Enter withdrawal amount\n"
+            "  4. Submit for admin approval\n\n"
+            
+            "• *UTR Number:*\n"
+            "  A 12-18 digit number from your payment receipt\n\n"
+            
+            "⚠️ *Important:*\n"
+            "• Always use official payment methods\n"
+            "• Keep screenshots for reference\n"
+            "• Admin approval required for all transactions\n"
+        )
+        
+        if update.message:
+            await update.message.reply_text(help_text, parse_mode='Markdown')
+        else:
+            await update.callback_query.edit_message_text(
+                help_text,
+                reply_markup=get_main_menu_keyboard(),
+                parse_mode='Markdown'
+            )
+        
+        return MAIN_MENU
+    except Exception as e:
+        logger.error(f"Error in help command: {e}")
+        return MAIN_MENU
 
 # ================= CALLBACK QUERY HANDLERS =================
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle all callback queries"""
-    query = update.callback_query
-    await query.answer()
-    
-    data = query.data
-    user_id = query.from_user.id
-    
-    # Get user from database
-    user = get_or_create_user(user_id, query.from_user.username)
-    if not user:
-        await query.edit_message_text("❌ Database error. Please try again.")
-        return ConversationHandler.END
-    
-    # Handle different callback actions
-    if data == "deposit":
-        return await handle_deposit(query, context)
-    elif data == "withdraw":
-        return await handle_withdraw(query, context, user)
-    elif data == "balance":
-        return await handle_balance(query, context, user)
-    elif data == "help":
-        return await handle_help(query, context)
-    elif data.startswith("amount_"):
-        return await handle_amount_selection(query, context)
-    elif data == "proceed":
-        return await handle_proceed(query, context, user)
-    elif data == "payment_done":
-        return await handle_payment_done(query, context)
-    elif data == "cancel":
-        return await handle_cancel(query, context)
-    
-    return MAIN_MENU
+    try:
+        query = update.callback_query
+        await query.answer()
+        
+        data = query.data
+        user_id = query.from_user.id
+        
+        # Get user from database
+        user = get_or_create_user(user_id, query.from_user.username)
+        
+        # Handle different callback actions
+        if data == "deposit":
+            return await handle_deposit(query, context)
+        elif data == "withdraw":
+            return await handle_withdraw(query, context, user)
+        elif data == "balance":
+            return await handle_balance(query, context, user)
+        elif data == "help":
+            return await handle_help(query, context)
+        elif data.startswith("amount_"):
+            return await handle_amount_selection(query, context)
+        elif data == "proceed":
+            return await handle_proceed(query, context, user)
+        elif data == "payment_done":
+            return await handle_payment_done(query, context)
+        elif data == "cancel":
+            return await handle_cancel(query, context)
+        
+        return MAIN_MENU
+    except Exception as e:
+        logger.error(f"Error in callback query handler: {e}")
+        return MAIN_MENU
 
 async def handle_deposit(query, context):
     """Handle deposit button click"""
-    # Initialize selected amounts if not exists
-    if "selected_amounts" not in context.user_data:
-        context.user_data["selected_amounts"] = []
-    
-    text = (
-        "💰 *Deposit Funds*\n\n"
-        "Select amount(s) to deposit:\n"
-        f"Total selected: ₹{sum(context.user_data['selected_amounts'])}\n\n"
-        "Click amounts to select/deselect, then click ✅ Proceed"
-    )
-    
-    await query.edit_message_text(
-        text,
-        reply_markup=get_deposit_amount_keyboard(context.user_data["selected_amounts"]),
-        parse_mode='Markdown'
-    )
-    
-    return DEPOSIT_SELECT_AMOUNT
-
-async def handle_withdraw(query, context, user):
-    """Handle withdraw button click"""
-    if user.get("balance", 0) <= 0:
+    try:
+        # Initialize selected amounts if not exists
+        if "selected_amounts" not in context.user_data:
+            context.user_data["selected_amounts"] = []
+        
+        text = (
+            "💰 *Deposit Funds*\n\n"
+            "Select amount(s) to deposit:\n"
+            f"Total selected: ₹{sum(context.user_data['selected_amounts'])}\n\n"
+            "Click amounts to select/deselect, then click ✅ Proceed"
+        )
+        
         await query.edit_message_text(
-            "❌ Insufficient balance for withdrawal.",
+            text,
+            reply_markup=get_deposit_amount_keyboard(context.user_data["selected_amounts"]),
+            parse_mode='Markdown'
+        )
+        
+        return DEPOSIT_SELECT_AMOUNT
+    except Exception as e:
+        logger.error(f"Error in handle_deposit: {e}")
+        await query.edit_message_text(
+            "❌ An error occurred. Please try again.",
             reply_markup=get_main_menu_keyboard()
         )
         return MAIN_MENU
-    
-    await query.edit_message_text(
-        "💸 *Withdraw Funds*\n\n"
-        "Please enter your UPI ID (e.g., username@upi):",
-        reply_markup=get_cancel_keyboard(),
-        parse_mode='Markdown'
-    )
-    
-    context.user_data["withdraw_data"] = {}
-    return WITHDRAW_ENTER_UPI
+
+async def handle_withdraw(query, context, user):
+    """Handle withdraw button click"""
+    try:
+        if user.get("balance", 0) <= 0:
+            await query.edit_message_text(
+                "❌ Insufficient balance for withdrawal.",
+                reply_markup=get_main_menu_keyboard()
+            )
+            return MAIN_MENU
+        
+        await query.edit_message_text(
+            "💸 *Withdraw Funds*\n\n"
+            "Please enter your UPI ID (e.g., username@upi):",
+            reply_markup=get_cancel_keyboard(),
+            parse_mode='Markdown'
+        )
+        
+        context.user_data["withdraw_data"] = {}
+        return WITHDRAW_ENTER_UPI
+    except Exception as e:
+        logger.error(f"Error in handle_withdraw: {e}")
+        await query.edit_message_text(
+            "❌ An error occurred. Please try again.",
+            reply_markup=get_main_menu_keyboard()
+        )
+        return MAIN_MENU
 
 async def handle_balance(query, context, user):
     """Handle balance check"""
-    balance_text = (
-        f"📊 *Account Balance*\n\n"
-        f"• Available Balance: ₹{user.get('balance', 0):.2f}\n"
-        f"• Total Deposits: ₹{user.get('total_deposits', 0):.2f}\n"
-        f"• Total Withdrawals: ₹{user.get('total_withdrawals', 0):.2f}\n\n"
-        f"User ID: `{user.get('uid', 'N/A')}`"
-    )
-    
-    await query.edit_message_text(
-        balance_text,
-        reply_markup=get_main_menu_keyboard(),
-        parse_mode='Markdown'
-    )
-    
-    return MAIN_MENU
+    try:
+        balance_text = (
+            f"📊 *Account Balance*\n\n"
+            f"• Available Balance: ₹{user.get('balance', 0):.2f}\n"
+            f"• Total Deposits: ₹{user.get('total_deposits', 0):.2f}\n"
+            f"• Total Withdrawals: ₹{user.get('total_withdrawals', 0):.2f}\n\n"
+            f"User ID: `{user.get('uid', 'N/A')}`"
+        )
+        
+        await query.edit_message_text(
+            balance_text,
+            reply_markup=get_main_menu_keyboard(),
+            parse_mode='Markdown'
+        )
+        
+        return MAIN_MENU
+    except Exception as e:
+        logger.error(f"Error in handle_balance: {e}")
+        await query.edit_message_text(
+            "❌ Error fetching balance. Please try again.",
+            reply_markup=get_main_menu_keyboard()
+        )
+        return MAIN_MENU
 
 async def handle_help(query, context):
     """Handle help from menu"""
@@ -360,213 +419,246 @@ async def handle_help(query, context):
 
 async def handle_amount_selection(query, context):
     """Handle amount selection for deposit"""
-    amount = int(query.data.split("_")[1])
-    selected_amounts = context.user_data.get("selected_amounts", [])
-    
-    if amount in selected_amounts:
-        selected_amounts.remove(amount)
-    else:
-        selected_amounts.append(amount)
-    
-    context.user_data["selected_amounts"] = selected_amounts
-    
-    total = sum(selected_amounts)
-    text = (
-        f"💰 *Deposit Funds*\n\n"
-        f"Select amount(s) to deposit:\n"
-        f"Total selected: ₹{total}\n\n"
-        f"Click amounts to select/deselect, then click ✅ Proceed"
-    )
-    
-    await query.edit_message_text(
-        text,
-        reply_markup=get_deposit_amount_keyboard(selected_amounts),
-        parse_mode='Markdown'
-    )
-    
-    return DEPOSIT_SELECT_AMOUNT
+    try:
+        amount = int(query.data.split("_")[1])
+        selected_amounts = context.user_data.get("selected_amounts", [])
+        
+        if amount in selected_amounts:
+            selected_amounts.remove(amount)
+        else:
+            selected_amounts.append(amount)
+        
+        context.user_data["selected_amounts"] = selected_amounts
+        
+        total = sum(selected_amounts)
+        text = (
+            f"💰 *Deposit Funds*\n\n"
+            f"Select amount(s) to deposit:\n"
+            f"Total selected: ₹{total}\n\n"
+            f"Click amounts to select/deselect, then click ✅ Proceed"
+        )
+        
+        await query.edit_message_text(
+            text,
+            reply_markup=get_deposit_amount_keyboard(selected_amounts),
+            parse_mode='Markdown'
+        )
+        
+        return DEPOSIT_SELECT_AMOUNT
+    except Exception as e:
+        logger.error(f"Error in handle_amount_selection: {e}")
+        await query.edit_message_text(
+            "❌ Error selecting amount. Please try again.",
+            reply_markup=get_main_menu_keyboard()
+        )
+        return MAIN_MENU
 
 async def handle_proceed(query, context, user):
     """Handle proceed to payment - SHOWS QR CODE"""
-    selected_amounts = context.user_data.get("selected_amounts", [])
-    
-    if not selected_amounts:
-        await query.edit_message_text(
-            "❌ Please select at least one amount.",
-            reply_markup=get_deposit_amount_keyboard()
-        )
-        return DEPOSIT_SELECT_AMOUNT
-    
-    total_amount = sum(selected_amounts)
-    context.user_data["deposit_amount"] = total_amount
-    
-    # Store deposit info in user data
-    context.user_data["deposit_info"] = {
-        "amount": total_amount,
-        "user_id": user["telegram_id"],
-        "username": user.get("username", "N/A"),
-        "user_uid": user.get("uid", "N/A")
-    }
-    
-    # Show QR code image
     try:
-        with open("qr.jpg", "rb") as qr_file:
-            await query.message.reply_photo(
-                photo=qr_file,
-                caption=f"💳 *Pay ₹{total_amount}*\n\nClick '✅ Payment Done' after payment",
+        selected_amounts = context.user_data.get("selected_amounts", [])
+        
+        if not selected_amounts:
+            await query.edit_message_text(
+                "❌ Please select at least one amount.",
+                reply_markup=get_deposit_amount_keyboard()
+            )
+            return DEPOSIT_SELECT_AMOUNT
+        
+        total_amount = sum(selected_amounts)
+        context.user_data["deposit_amount"] = total_amount
+        
+        # Store deposit info in user data
+        context.user_data["deposit_info"] = {
+            "amount": total_amount,
+            "user_id": user["telegram_id"],
+            "username": user.get("username", "N/A"),
+            "user_uid": user.get("uid", "N/A")
+        }
+        
+        # Show QR code image
+        try:
+            with open("qr.jpg", "rb") as qr_file:
+                await query.message.reply_photo(
+                    photo=qr_file,
+                    caption=f"💳 *Pay ₹{total_amount}*\n\nClick '✅ Payment Done' after payment",
+                    reply_markup=get_payment_done_keyboard(),
+                    parse_mode='Markdown'
+                )
+        except FileNotFoundError:
+            # Fallback if QR file is missing
+            payment_text = (
+                f"💳 *Pay ₹{total_amount}*\n\n"
+                f"1. Pay ₹{total_amount} to merchant\n"
+                f"2. Click '✅ Payment Done' after payment\n\n"
+                f"⚠️ Do not click until payment is completed!"
+            )
+            await query.edit_message_text(
+                payment_text,
                 reply_markup=get_payment_done_keyboard(),
                 parse_mode='Markdown'
             )
-    except FileNotFoundError:
-        # Fallback if QR file is missing
-        payment_text = (
-            f"💳 *Pay ₹{total_amount}*\n\n"
-            f"1. Pay ₹{total_amount} to merchant\n"
-            f"2. Click '✅ Payment Done' after payment\n\n"
-            f"⚠️ Do not click until payment is completed!"
-        )
+        
+        return DEPOSIT_WAIT_PAYMENT
+    except Exception as e:
+        logger.error(f"Error in handle_proceed: {e}")
         await query.edit_message_text(
-            payment_text,
-            reply_markup=get_payment_done_keyboard(),
-            parse_mode='Markdown'
+            "❌ Error processing payment. Please try again.",
+            reply_markup=get_main_menu_keyboard()
         )
-    
-    return DEPOSIT_WAIT_PAYMENT
+        return MAIN_MENU
 
 async def handle_payment_done(query, context):
     """Handle payment done button"""
-    await query.edit_message_text(
-        "📤 *Send Payment Proof*\n\n"
-        "Please send:\n"
-        "1. Payment screenshot\n"
-        "2. UTR number (12-18 digits)\n\n"
-        "Send screenshot first, then UTR in next message.",
-        reply_markup=get_cancel_keyboard(),
-        parse_mode='Markdown'
-    )
-    
-    return DEPOSIT_WAIT_SCREENSHOT
-
-async def handle_cancel(query, context):
-    """Handle cancel action"""
-    # Clear user data
-    if "selected_amounts" in context.user_data:
-        del context.user_data["selected_amounts"]
-    if "deposit_amount" in context.user_data:
-        del context.user_data["deposit_amount"]
-    if "deposit_info" in context.user_data:
-        del context.user_data["deposit_info"]
-    if "withdraw_data" in context.user_data:
-        del context.user_data["withdraw_data"]
-    
-    await query.edit_message_text(
-        "Operation cancelled. What would you like to do?",
-        reply_markup=get_main_menu_keyboard()
-    )
-    
-    return MAIN_MENU
-
-# ================= MESSAGE HANDLERS =================
-async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle payment screenshot"""
-    if update.message.photo:
-        # Store the file_id of the largest photo
-        context.user_data["screenshot_id"] = update.message.photo[-1].file_id
-        
-        await update.message.reply_text(
-            "✅ Screenshot received!\n\n"
-            "📝 *Now send UTR Number*\n\n"
-            "Please enter the UTR number (12-18 digits):",
+    try:
+        await query.edit_message_text(
+            "📤 *Send Payment Proof*\n\n"
+            "Please send:\n"
+            "1. Payment screenshot\n"
+            "2. UTR number (12-18 digits)\n\n"
+            "Send screenshot first, then UTR in next message.",
             reply_markup=get_cancel_keyboard(),
             parse_mode='Markdown'
         )
         
-        return DEPOSIT_WAIT_UTR
-    
-    await update.message.reply_text(
-        "❌ Please send a valid screenshot image.",
-        reply_markup=get_cancel_keyboard()
-    )
-    return DEPOSIT_WAIT_SCREENSHOT
-
-async def handle_utr(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle UTR input"""
-    utr = update.message.text.strip()
-    
-    # Validate UTR
-    if not re.match(UTR_REGEX, utr):
-        await update.message.reply_text(
-            "❌ Invalid UTR format.\n"
-            "Please enter 12-18 digits only.\n\n"
-            "Example: 123456789012",
-            reply_markup=get_cancel_keyboard()
-        )
-        return DEPOSIT_WAIT_UTR
-    
-    # Check if UTR already exists
-    if deposits_col:
-        existing = deposits_col.find_one({"utr": utr})
-        if existing:
-            await update.message.reply_text(
-                "❌ This UTR has already been submitted.\n"
-                "Please contact admin if this is an error.",
-                reply_markup=get_main_menu_keyboard()
-            )
-            return MAIN_MENU
-    
-    # Get deposit info
-    deposit_info = context.user_data.get("deposit_info", {})
-    amount = context.user_data.get("deposit_amount", 0)
-    
-    if not deposit_info or amount <= 0:
-        await update.message.reply_text(
-            "❌ Session expired. Please start over.",
+        return DEPOSIT_WAIT_SCREENSHOT
+    except Exception as e:
+        logger.error(f"Error in handle_payment_done: {e}")
+        await query.edit_message_text(
+            "❌ Error. Please start over.",
             reply_markup=get_main_menu_keyboard()
         )
         return MAIN_MENU
-    
-    # Create deposit record
-    deposit_id = str(uuid.uuid4())
-    deposit_record = {
-        "deposit_id": deposit_id,
-        "user_id": deposit_info["user_id"],
-        "user_uid": deposit_info["user_uid"],
-        "username": deposit_info.get("username"),
-        "amount": amount,
-        "utr": utr,
-        "screenshot_id": context.user_data.get("screenshot_id"),
-        "status": "REQUESTED",
-        "created_at": datetime.utcnow(),
-        "updated_at": datetime.utcnow(),
-        "last_reminder": datetime.utcnow(),
-        "admin_msg_id": None
-    }
-    
+
+async def handle_cancel(query, context):
+    """Handle cancel action"""
     try:
+        # Clear user data
+        context.user_data.clear()
+        
+        await query.edit_message_text(
+            "Operation cancelled. What would you like to do?",
+            reply_markup=get_main_menu_keyboard()
+        )
+        
+        return MAIN_MENU
+    except Exception as e:
+        logger.error(f"Error in handle_cancel: {e}")
+        return MAIN_MENU
+
+# ================= MESSAGE HANDLERS =================
+async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle payment screenshot"""
+    try:
+        if update.message.photo:
+            # Store the file_id of the largest photo
+            context.user_data["screenshot_id"] = update.message.photo[-1].file_id
+            
+            await update.message.reply_text(
+                "✅ Screenshot received!\n\n"
+                "📝 *Now send UTR Number*\n\n"
+                "Please enter the UTR number (12-18 digits):",
+                reply_markup=get_cancel_keyboard(),
+                parse_mode='Markdown'
+            )
+            
+            return DEPOSIT_WAIT_UTR
+        
+        await update.message.reply_text(
+            "❌ Please send a valid screenshot image.",
+            reply_markup=get_cancel_keyboard()
+        )
+        return DEPOSIT_WAIT_SCREENSHOT
+    except Exception as e:
+        logger.error(f"Error in handle_screenshot: {e}")
+        await update.message.reply_text(
+            "❌ Error processing screenshot. Please try again.",
+            reply_markup=get_cancel_keyboard()
+        )
+        return DEPOSIT_WAIT_SCREENSHOT
+
+async def handle_utr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle UTR input"""
+    try:
+        utr = update.message.text.strip()
+        
+        # Validate UTR
+        if not re.match(UTR_REGEX, utr):
+            await update.message.reply_text(
+                "❌ Invalid UTR format.\n"
+                "Please enter 12-18 digits only.\n\n"
+                "Example: 123456789012",
+                reply_markup=get_cancel_keyboard()
+            )
+            return DEPOSIT_WAIT_UTR
+        
+        # Check if UTR already exists
+        if deposits_col is not None:
+            existing = deposits_col.find_one({"utr": utr})
+            if existing:
+                await update.message.reply_text(
+                    "❌ This UTR has already been submitted.\n"
+                    "Please contact admin if this is an error.",
+                    reply_markup=get_main_menu_keyboard()
+                )
+                return MAIN_MENU
+        
+        # Get deposit info
+        deposit_info = context.user_data.get("deposit_info", {})
+        amount = context.user_data.get("deposit_amount", 0)
+        
+        if not deposit_info or amount <= 0:
+            await update.message.reply_text(
+                "❌ Session expired. Please start over.",
+                reply_markup=get_main_menu_keyboard()
+            )
+            return MAIN_MENU
+        
+        # Create deposit record
+        deposit_id = str(uuid.uuid4())[:8]
+        deposit_record = {
+            "deposit_id": deposit_id,
+            "user_id": deposit_info["user_id"],
+            "user_uid": deposit_info["user_uid"],
+            "username": deposit_info.get("username"),
+            "amount": amount,
+            "utr": utr,
+            "screenshot_id": context.user_data.get("screenshot_id"),
+            "status": "REQUESTED",
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow(),
+            "last_reminder": datetime.utcnow(),
+            "admin_msg_id": None
+        }
+        
         # Insert deposit record
-        if deposits_col:
+        if deposits_col is not None:
             deposits_col.insert_one(deposit_record)
         
         # Send screenshot to admin group
         screenshot_id = context.user_data.get("screenshot_id", "")
-        if screenshot_id:
-            try:
+        try:
+            if screenshot_id:
                 await context.bot.send_photo(
                     DEPOSIT_REQUESTS_GROUP_ID,
                     photo=screenshot_id,
                     caption=f"🟡 NEW DEPOSIT\n\nUser: {deposit_info['user_id']}\nAmount: ₹{amount}\nUTR: {utr}\n\nReply: CONFIRM {utr}"
                 )
-            except:
-                # Send text if photo fails
+            else:
                 await context.bot.send_message(
                     DEPOSIT_REQUESTS_GROUP_ID,
                     f"🟡 NEW DEPOSIT\n\nUser: {deposit_info['user_id']}\nAmount: ₹{amount}\nUTR: {utr}\n\nReply: CONFIRM {utr}"
                 )
-        else:
-            await context.bot.send_message(
-                DEPOSIT_REQUESTS_GROUP_ID,
-                f"🟡 NEW DEPOSIT\n\nUser: {deposit_info['user_id']}\nAmount: ₹{amount}\nUTR: {utr}\n\nReply: CONFIRM {utr}"
-            )
+        except Exception as e:
+            logger.error(f"Error sending to admin group: {e}")
+            # Try to send to admin directly
+            try:
+                await context.bot.send_message(
+                    ADMIN_ID,
+                    f"DEPOSIT REQUEST (Group send failed):\nUser: {deposit_info['user_id']}\nAmount: ₹{amount}\nUTR: {utr}\n\nReply: CONFIRM {utr}"
+                )
+            except:
+                pass
         
         # Notify user
         await update.message.reply_text(
@@ -582,43 +674,51 @@ async def handle_utr(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Clear user data
         context.user_data.clear()
         
+        return MAIN_MENU
     except Exception as e:
-        logger.error(f"Error creating deposit: {e}")
+        logger.error(f"Error in handle_utr: {e}")
         await update.message.reply_text(
-            "❌ An error occurred. Please try again.",
+            "❌ Error submitting deposit. Please try again.",
             reply_markup=get_main_menu_keyboard()
         )
-    
-    return MAIN_MENU
+        return MAIN_MENU
 
 async def handle_upi_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle UPI ID input for withdrawal"""
-    upi_id = update.message.text.strip().lower()
-    
-    # Basic UPI validation
-    if not "@" in upi_id or len(upi_id) < 5:
+    try:
+        upi_id = update.message.text.strip().lower()
+        
+        # Basic UPI validation
+        if not "@" in upi_id or len(upi_id) < 5:
+            await update.message.reply_text(
+                "❌ Invalid UPI ID format.\n"
+                "Please enter a valid UPI ID (e.g., username@upi):",
+                reply_markup=get_cancel_keyboard()
+            )
+            return WITHDRAW_ENTER_UPI
+        
+        context.user_data["withdraw_data"]["upi_id"] = upi_id
+        
+        user = get_or_create_user(update.effective_user.id)
+        max_amount = user.get("balance", 0)
+        
         await update.message.reply_text(
-            "❌ Invalid UPI ID format.\n"
-            "Please enter a valid UPI ID (e.g., username@upi):",
+            f"💸 *Enter Withdrawal Amount*\n\n"
+            f"Your balance: ₹{max_amount:.2f}\n"
+            f"UPI ID: {upi_id}\n\n"
+            f"Enter amount (max ₹{max_amount:.2f}):",
+            reply_markup=get_cancel_keyboard(),
+            parse_mode='Markdown'
+        )
+        
+        return WITHDRAW_ENTER_AMOUNT
+    except Exception as e:
+        logger.error(f"Error in handle_upi_id: {e}")
+        await update.message.reply_text(
+            "❌ Error processing UPI ID. Please try again.",
             reply_markup=get_cancel_keyboard()
         )
         return WITHDRAW_ENTER_UPI
-    
-    context.user_data["withdraw_data"]["upi_id"] = upi_id
-    
-    user = get_or_create_user(update.effective_user.id)
-    max_amount = user.get("balance", 0)
-    
-    await update.message.reply_text(
-        f"💸 *Enter Withdrawal Amount*\n\n"
-        f"Your balance: ₹{max_amount:.2f}\n"
-        f"UPI ID: {upi_id}\n\n"
-        f"Enter amount (max ₹{max_amount:.2f}):",
-        reply_markup=get_cancel_keyboard(),
-        parse_mode='Markdown'
-    )
-    
-    return WITHDRAW_ENTER_AMOUNT
 
 async def handle_withdraw_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle withdrawal amount input"""
@@ -685,44 +785,51 @@ async def handle_withdraw_amount(update: Update, context: ContextTypes.DEFAULT_T
             reply_markup=get_cancel_keyboard()
         )
         return WITHDRAW_ENTER_AMOUNT
+    except Exception as e:
+        logger.error(f"Error in handle_withdraw_amount: {e}")
+        await update.message.reply_text(
+            "❌ Error processing amount. Please try again.",
+            reply_markup=get_cancel_keyboard()
+        )
+        return WITHDRAW_ENTER_AMOUNT
 
 async def handle_confirm_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle withdrawal confirmation"""
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = query.from_user.id
-    user = get_or_create_user(user_id, query.from_user.username)
-    
-    withdraw_data = context.user_data.get("withdraw_data", {})
-    upi_id = withdraw_data.get("upi_id")
-    amount = withdraw_data.get("amount")
-    
-    if not upi_id or not amount:
-        await query.edit_message_text(
-            "❌ Withdrawal data missing. Please start over.",
-            reply_markup=get_main_menu_keyboard()
-        )
-        return MAIN_MENU
-    
-    # Create withdrawal record
-    withdrawal_id = str(uuid.uuid4())
-    withdrawal_record = {
-        "withdrawal_id": withdrawal_id,
-        "user_id": user_id,
-        "user_uid": user.get("uid"),
-        "username": user.get("username"),
-        "upi_id": upi_id,
-        "amount": amount,
-        "status": "REQUESTED",
-        "created_at": datetime.utcnow(),
-        "updated_at": datetime.utcnow(),
-        "admin_msg_id": None
-    }
-    
     try:
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = query.from_user.id
+        user = get_or_create_user(user_id, query.from_user.username)
+        
+        withdraw_data = context.user_data.get("withdraw_data", {})
+        upi_id = withdraw_data.get("upi_id")
+        amount = withdraw_data.get("amount")
+        
+        if not upi_id or not amount:
+            await query.edit_message_text(
+                "❌ Withdrawal data missing. Please start over.",
+                reply_markup=get_main_menu_keyboard()
+            )
+            return MAIN_MENU
+        
+        # Create withdrawal record
+        withdrawal_id = str(uuid.uuid4())[:8]
+        withdrawal_record = {
+            "withdrawal_id": withdrawal_id,
+            "user_id": user_id,
+            "user_uid": user.get("uid"),
+            "username": user.get("username"),
+            "upi_id": upi_id,
+            "amount": amount,
+            "status": "REQUESTED",
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow(),
+            "admin_msg_id": None
+        }
+        
         # Insert withdrawal record
-        if withdrawals_col:
+        if withdrawals_col is not None:
             withdrawals_col.insert_one(withdrawal_record)
         
         # Send notification to admin group
@@ -739,24 +846,20 @@ async def handle_confirm_withdraw(update: Update, context: ContextTypes.DEFAULT_
         
         # Try to send to withdraw group, fallback to admin
         try:
-            msg = await context.bot.send_message(
+            await context.bot.send_message(
                 WITHDRAW_REQUESTS_GROUP_ID,
                 admin_text,
                 parse_mode='Markdown'
             )
-            # Update with message ID
-            if withdrawals_col:
-                withdrawals_col.update_one(
-                    {"withdrawal_id": withdrawal_id},
-                    {"$set": {"admin_msg_id": msg.message_id}}
-                )
         except:
-            # Send to admin directly if group doesn't exist
-            await context.bot.send_message(
-                ADMIN_ID,
-                admin_text,
-                parse_mode='Markdown'
-            )
+            try:
+                await context.bot.send_message(
+                    ADMIN_ID,
+                    admin_text,
+                    parse_mode='Markdown'
+                )
+            except:
+                pass
         
         # Notify user
         await query.edit_message_text(
@@ -772,175 +875,187 @@ async def handle_confirm_withdraw(update: Update, context: ContextTypes.DEFAULT_
         # Clear user data
         context.user_data.clear()
         
+        return MAIN_MENU
     except Exception as e:
-        logger.error(f"Error creating withdrawal: {e}")
-        await query.edit_message_text(
-            "❌ An error occurred. Please try again.",
+        logger.error(f"Error in handle_confirm_withdraw: {e}")
+        await update.callback_query.edit_message_text(
+            "❌ Error submitting withdrawal. Please try again.",
             reply_markup=get_main_menu_keyboard()
         )
-    
-    return MAIN_MENU
+        return MAIN_MENU
 
+# ================= ADMIN HANDLER =================
 async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle admin commands - FIXED CONFIRM LOGIC"""
-    if update.effective_user.id != ADMIN_ID:
-        return
-    
-    text = update.message.text.strip().upper()
-    
-    # Handle deposit confirmation
-    if text.startswith("CONFIRM"):
-        # Extract UTR from message
-        parts = text.split()
-        if len(parts) >= 2:
-            utr = parts[1]  # "CONFIRM 123456"
-        elif len(text) > 7:
-            utr = text[7:].strip()  # "CONFIRM123456"
-        else:
-            await update.message.reply_text("❌ Format: CONFIRM UTR")
+    try:
+        if update.effective_user.id != ADMIN_ID:
             return
         
-        # Find deposit
-        deposit = None
-        if deposits_col:
-            deposit = deposits_col.find_one({"utr": utr, "status": {"$in": ["REQUESTED", "PENDING"]}})
+        text = update.message.text.strip().upper()
         
-        if not deposit:
-            await update.message.reply_text(f"❌ Deposit not found or already processed.")
-            return
-        
-        # Delete message from current group
-        try:
-            if deposit.get("status") == "REQUESTED":
-                await context.bot.delete_message(
-                    DEPOSIT_REQUESTS_GROUP_ID,
-                    deposit.get("admin_msg_id")
+        # Handle deposit confirmation
+        if text.startswith("CONFIRM"):
+            # Extract UTR from message
+            parts = text.split()
+            if len(parts) >= 2:
+                utr = parts[1]  # "CONFIRM 123456"
+            elif len(text) > 7:
+                utr = text[7:].strip()  # "CONFIRM123456"
+            else:
+                await update.message.reply_text("❌ Format: CONFIRM UTR")
+                return
+            
+            # Find deposit
+            deposit = None
+            if deposits_col is not None:
+                deposit = deposits_col.find_one({"utr": utr, "status": {"$in": ["REQUESTED", "PENDING"]}})
+            
+            if not deposit:
+                await update.message.reply_text(f"❌ Deposit not found or already processed.")
+                return
+            
+            # Delete message from current group
+            try:
+                if deposit.get("status") == "REQUESTED":
+                    await context.bot.delete_message(
+                        DEPOSIT_REQUESTS_GROUP_ID,
+                        deposit.get("admin_msg_id")
+                    )
+                elif deposit.get("status") == "PENDING":
+                    await context.bot.delete_message(
+                        DEPOSIT_PENDING_GROUP_ID,
+                        deposit.get("admin_msg_id")
+                    )
+            except Exception as e:
+                logger.warning(f"Could not delete message: {e}")
+            
+            # Update deposit status
+            if deposits_col is not None:
+                deposits_col.update_one(
+                    {"utr": utr},
+                    {"$set": {"status": "COMPLETED", "updated_at": datetime.utcnow()}}
                 )
-            elif deposit.get("status") == "PENDING":
-                await context.bot.delete_message(
-                    DEPOSIT_PENDING_GROUP_ID,
-                    deposit.get("admin_msg_id")
+            
+            # Update user balance
+            update_user_balance(deposit["user_id"], deposit["amount"], is_deposit=True)
+            
+            # Send to completed group
+            completed_text = (
+                f"✅ *DEPOSIT COMPLETED*\n\n"
+                f"• User: {deposit['user_id']}\n"
+                f"• Amount: ₹{deposit['amount']}\n"
+                f"• UTR: `{utr}`\n"
+                f"• Time: {datetime.utcnow().strftime('%H:%M:%S')}"
+            )
+            
+            await context.bot.send_message(
+                DEPOSIT_COMPLETED_GROUP_ID,
+                completed_text,
+                parse_mode='Markdown'
+            )
+            
+            # Notify user
+            try:
+                await context.bot.send_message(
+                    deposit["user_id"],
+                    f"✅ Deposit of ₹{deposit['amount']} has been confirmed!\n"
+                    f"Your balance has been updated.",
+                    reply_markup=get_main_menu_keyboard()
                 )
-        except Exception as e:
-            logger.warning(f"Could not delete message: {e}")
+            except Exception as e:
+                logger.error(f"Could not notify user: {e}")
+            
+            await update.message.reply_text(f"✅ Deposit confirmed for UTR: {utr}")
         
-        # Update deposit status
-        if deposits_col:
-            deposits_col.update_one(
-                {"utr": utr},
-                {"$set": {"status": "COMPLETED", "updated_at": datetime.utcnow()}}
+        # Handle withdrawal completion
+        elif text.startswith("DONE"):
+            # Extract withdrawal ID
+            parts = text.split()
+            if len(parts) >= 2:
+                withdrawal_id = parts[1]
+            elif len(text) > 4:
+                withdrawal_id = text[4:].strip()
+            else:
+                await update.message.reply_text("❌ Format: DONE WITHDRAWAL_ID")
+                return
+            
+            # Find withdrawal
+            withdrawal = None
+            if withdrawals_col is not None:
+                withdrawal = withdrawals_col.find_one({
+                    "withdrawal_id": withdrawal_id,
+                    "status": "REQUESTED"
+                })
+            
+            if not withdrawal:
+                await update.message.reply_text(f"❌ Withdrawal not found or already processed.")
+                return
+            
+            # Delete from requests group
+            try:
+                await context.bot.delete_message(
+                    WITHDRAW_REQUESTS_GROUP_ID,
+                    withdrawal.get("admin_msg_id")
+                )
+            except Exception as e:
+                logger.warning(f"Could not delete message: {e}")
+            
+            # Update withdrawal status
+            if withdrawals_col is not None:
+                withdrawals_col.update_one(
+                    {"withdrawal_id": withdrawal_id},
+                    {"$set": {"status": "COMPLETED", "updated_at": datetime.utcnow()}}
+                )
+            
+            # Update user balance (deduct)
+            update_user_balance(withdrawal["user_id"], -withdrawal["amount"], is_deposit=False)
+            
+            # Send to completed group
+            completed_text = (
+                f"✅ *WITHDRAWAL COMPLETED*\n\n"
+                f"• User: {withdrawal['user_id']}\n"
+                f"• Amount: ₹{withdrawal['amount']:.2f}\n"
+                f"• UPI ID: `{withdrawal['upi_id']}`\n"
+                f"• Time: {datetime.utcnow().strftime('%H:%M:%S')}"
             )
-        
-        # Update user balance
-        update_user_balance(deposit["user_id"], deposit["amount"], is_deposit=True)
-        
-        # Send to completed group
-        completed_text = (
-            f"✅ *DEPOSIT COMPLETED*\n\n"
-            f"• User: {deposit['user_id']}\n"
-            f"• Amount: ₹{deposit['amount']}\n"
-            f"• UTR: `{utr}`\n"
-            f"• Time: {datetime.utcnow().strftime('%H:%M:%S')}"
-        )
-        
-        await context.bot.send_message(
-            DEPOSIT_COMPLETED_GROUP_ID,
-            completed_text,
-            parse_mode='Markdown'
-        )
-        
-        # Notify user
-        try:
+            
             await context.bot.send_message(
-                deposit["user_id"],
-                f"✅ Deposit of ₹{deposit['amount']} has been confirmed!\n"
-                f"Your balance has been updated.",
-                reply_markup=get_main_menu_keyboard()
+                WITHDRAW_COMPLETED_GROUP_ID,
+                completed_text,
+                parse_mode='Markdown'
             )
-        except Exception as e:
-            logger.error(f"Could not notify user: {e}")
-        
-        await update.message.reply_text(f"✅ Deposit confirmed for UTR: {utr}")
-    
-    # Handle withdrawal completion
-    elif text.startswith("DONE"):
-        # Extract withdrawal ID
-        parts = text.split()
-        if len(parts) >= 2:
-            withdrawal_id = parts[1]
-        elif len(text) > 4:
-            withdrawal_id = text[4:].strip()
-        else:
-            await update.message.reply_text("❌ Format: DONE WITHDRAWAL_ID")
-            return
-        
-        # Find withdrawal
-        withdrawal = None
-        if withdrawals_col:
-            withdrawal = withdrawals_col.find_one({
-                "withdrawal_id": withdrawal_id,
-                "status": "REQUESTED"
-            })
-        
-        if not withdrawal:
-            await update.message.reply_text(f"❌ Withdrawal not found or already processed.")
-            return
-        
-        # Delete from requests group
+            
+            # Notify user
+            try:
+                await context.bot.send_message(
+                    withdrawal["user_id"],
+                    f"✅ Withdrawal of ₹{withdrawal['amount']:.2f} has been processed!\n"
+                    f"Amount sent to: {withdrawal['upi_id']}\n"
+                    f"Your balance has been updated.",
+                    reply_markup=get_main_menu_keyboard()
+                )
+            except Exception as e:
+                logger.error(f"Could not notify user: {e}")
+            
+            await update.message.reply_text(f"✅ Withdrawal processed for ID: {withdrawal_id}")
+    except Exception as e:
+        logger.error(f"Error in admin handler: {e}")
         try:
-            await context.bot.delete_message(
-                WITHDRAW_REQUESTS_GROUP_ID,
-                withdrawal.get("admin_msg_id")
-            )
-        except Exception as e:
-            logger.warning(f"Could not delete message: {e}")
-        
-        # Update withdrawal status
-        if withdrawals_col:
-            withdrawals_col.update_one(
-                {"withdrawal_id": withdrawal_id},
-                {"$set": {"status": "COMPLETED", "updated_at": datetime.utcnow()}}
-            )
-        
-        # Update user balance (deduct)
-        update_user_balance(withdrawal["user_id"], -withdrawal["amount"], is_deposit=False)
-        
-        # Send to completed group
-        completed_text = (
-            f"✅ *WITHDRAWAL COMPLETED*\n\n"
-            f"• User: {withdrawal['user_id']}\n"
-            f"• Amount: ₹{withdrawal['amount']:.2f}\n"
-            f"• UPI ID: `{withdrawal['upi_id']}`\n"
-            f"• Time: {datetime.utcnow().strftime('%H:%M:%S')}"
-        )
-        
-        await context.bot.send_message(
-            WITHDRAW_COMPLETED_GROUP_ID,
-            completed_text,
-            parse_mode='Markdown'
-        )
-        
-        # Notify user
-        try:
-            await context.bot.send_message(
-                withdrawal["user_id"],
-                f"✅ Withdrawal of ₹{withdrawal['amount']:.2f} has been processed!\n"
-                f"Amount sent to: {withdrawal['upi_id']}\n"
-                f"Your balance has been updated.",
-                reply_markup=get_main_menu_keyboard()
-            )
-        except Exception as e:
-            logger.error(f"Could not notify user: {e}")
-        
-        await update.message.reply_text(f"✅ Withdrawal processed for ID: {withdrawal_id}")
+            await update.message.reply_text(f"❌ Admin command error: {str(e)[:50]}")
+        except:
+            pass
 
 async def handle_unknown_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle unexpected messages"""
-    await update.message.reply_text(
-        "Please use the menu buttons to navigate.",
-        reply_markup=get_main_menu_keyboard()
-    )
-    return MAIN_MENU
+    try:
+        await update.message.reply_text(
+            "Please use the menu buttons to navigate.",
+            reply_markup=get_main_menu_keyboard()
+        )
+        return MAIN_MENU
+    except Exception as e:
+        logger.error(f"Error in handle_unknown_message: {e}")
+        return MAIN_MENU
 
 # ================= BACKGROUND TASKS =================
 async def deposit_watcher(application):
@@ -949,7 +1064,8 @@ async def deposit_watcher(application):
     
     while True:
         try:
-            if not deposits_col:
+            # FIXED: Proper None check for MongoDB collections
+            if deposits_col is None:
                 await asyncio.sleep(30)
                 continue
             
@@ -1040,70 +1156,121 @@ async def post_init(application):
     logger.info("Bot initialized. Starting background tasks...")
     asyncio.create_task(deposit_watcher(application))
 
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle errors in the bot"""
+    logger.error(f"Update {update} caused error {context.error}")
+    
+    if isinstance(context.error, telegram.error.Conflict):
+        logger.error("CONFLICT ERROR: Another bot instance is running. This bot will stop.")
+        # Don't restart here, let the main loop handle it
+        raise context.error
+    
+    try:
+        # Try to notify user of error
+        if update and update.effective_message:
+            await update.effective_message.reply_text(
+                "❌ An error occurred. Please try again.",
+                reply_markup=get_main_menu_keyboard()
+            )
+    except:
+        pass
+
 def main():
     """Main function to start the bot"""
-    # Create application
-    application = Application.builder().token(BOT_TOKEN).build()
+    max_restarts = 5
+    restart_count = 0
     
-    # Conversation handler for deposit flow
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            MAIN_MENU: [
-                CallbackQueryHandler(handle_callback_query, pattern="^(deposit|withdraw|balance|help)$"),
-            ],
-            DEPOSIT_SELECT_AMOUNT: [
-                CallbackQueryHandler(handle_callback_query, pattern="^(amount_|proceed|cancel)"),
-            ],
-            DEPOSIT_WAIT_PAYMENT: [
-                CallbackQueryHandler(handle_callback_query, pattern="^(payment_done|cancel)"),
-            ],
-            DEPOSIT_WAIT_SCREENSHOT: [
-                MessageHandler(filters.PHOTO, handle_screenshot),
-                CallbackQueryHandler(handle_callback_query, pattern="^cancel$"),
-            ],
-            DEPOSIT_WAIT_UTR: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_utr),
-                CallbackQueryHandler(handle_callback_query, pattern="^cancel$"),
-            ],
-            WITHDRAW_ENTER_UPI: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_upi_id),
-                CallbackQueryHandler(handle_callback_query, pattern="^cancel$"),
-            ],
-            WITHDRAW_ENTER_AMOUNT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_withdraw_amount),
-                CallbackQueryHandler(handle_callback_query, pattern="^cancel$"),
-            ],
-            WITHDRAW_CONFIRM: [
-                CallbackQueryHandler(handle_confirm_withdraw, pattern="^confirm_withdraw$"),
-                CallbackQueryHandler(handle_callback_query, pattern="^cancel$"),
-            ],
-        },
-        fallbacks=[
-            CommandHandler("start", start),
-            CommandHandler("help", help_command),
-            MessageHandler(filters.ALL, handle_unknown_message)
-        ],
-        allow_reentry=True
-    )
-    
-    # Add handlers
-    application.add_handler(conv_handler)
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(MessageHandler(
-        filters.User(ADMIN_ID) & filters.TEXT & ~filters.COMMAND,
-        handle_admin_message
-    ))
-    
-    # Set post initialization
-    application.post_init = post_init
-    
-    # Start polling
-    logger.info("Starting bot...")
-    application.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES
-    )
+    while restart_count < max_restarts:
+        try:
+            # Create application
+            application = Application.builder().token(BOT_TOKEN).build()
+            
+            # Add error handler
+            application.add_error_handler(error_handler)
+            
+            # Conversation handler for deposit flow
+            conv_handler = ConversationHandler(
+                entry_points=[CommandHandler("start", start)],
+                states={
+                    MAIN_MENU: [
+                        CallbackQueryHandler(handle_callback_query, pattern="^(deposit|withdraw|balance|help)$"),
+                    ],
+                    DEPOSIT_SELECT_AMOUNT: [
+                        CallbackQueryHandler(handle_callback_query, pattern="^(amount_|proceed|cancel)"),
+                    ],
+                    DEPOSIT_WAIT_PAYMENT: [
+                        CallbackQueryHandler(handle_callback_query, pattern="^(payment_done|cancel)"),
+                    ],
+                    DEPOSIT_WAIT_SCREENSHOT: [
+                        MessageHandler(filters.PHOTO, handle_screenshot),
+                        CallbackQueryHandler(handle_callback_query, pattern="^cancel$"),
+                    ],
+                    DEPOSIT_WAIT_UTR: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_utr),
+                        CallbackQueryHandler(handle_callback_query, pattern="^cancel$"),
+                    ],
+                    WITHDRAW_ENTER_UPI: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_upi_id),
+                        CallbackQueryHandler(handle_callback_query, pattern="^cancel$"),
+                    ],
+                    WITHDRAW_ENTER_AMOUNT: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_withdraw_amount),
+                        CallbackQueryHandler(handle_callback_query, pattern="^cancel$"),
+                    ],
+                    WITHDRAW_CONFIRM: [
+                        CallbackQueryHandler(handle_confirm_withdraw, pattern="^confirm_withdraw$"),
+                        CallbackQueryHandler(handle_callback_query, pattern="^cancel$"),
+                    ],
+                },
+                fallbacks=[
+                    CommandHandler("start", start),
+                    CommandHandler("help", help_command),
+                    MessageHandler(filters.ALL, handle_unknown_message)
+                ],
+                allow_reentry=True
+            )
+            
+            # Add handlers
+            application.add_handler(conv_handler)
+            application.add_handler(CommandHandler("help", help_command))
+            application.add_handler(MessageHandler(
+                filters.User(ADMIN_ID) & filters.TEXT & ~filters.COMMAND,
+                handle_admin_message
+            ))
+            
+            # Set post initialization
+            application.post_init = post_init
+            
+            # Start polling
+            logger.info(f"Starting bot... (Attempt {restart_count + 1}/{max_restarts})")
+            application.run_polling(
+                drop_pending_updates=True,
+                allowed_updates=Update.ALL_TYPES,
+                close_loop=False
+            )
+            
+            # If we get here, polling stopped without error
+            break
+            
+        except telegram.error.Conflict as e:
+            logger.error(f"CONFLICT ERROR: {e}")
+            restart_count += 1
+            if restart_count < max_restarts:
+                logger.info(f"Waiting 10 seconds before restart {restart_count}...")
+                time.sleep(10)
+            else:
+                logger.error("Max restart attempts reached. Bot will not restart.")
+                break
+                
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
+            restart_count += 1
+            if restart_count < max_restarts:
+                logger.info(f"Waiting 5 seconds before restart {restart_count}...")
+                time.sleep(5)
+            else:
+                logger.error("Max restart attempts reached. Bot will not restart.")
+                break
 
 if __name__ == "__main__":
     main()
