@@ -1,5 +1,5 @@
 services:
-  - type: web
+  - type: worker
     name: telegram-payment-bot
     env: python
     region: oregon
@@ -7,7 +7,6 @@ services:
     autoDeploy: true
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
-    # NO health check to avoid port conflicts
     envVars:
       - key: BOT_TOKEN
         value: "7998689373:AAGUaTxrHzWabJvqZAUM2NjRQb1PHXpmGqA"
