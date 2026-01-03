@@ -1004,7 +1004,7 @@ def main():
                 CommandHandler("help", help_command),
             ],
             allow_reentry=True,
-            per_message=False  # Changed back to False to fix the warning
+            per_message=False
         )
         
         # Add handlers
