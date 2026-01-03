@@ -2,6 +2,7 @@ import asyncio
 import re
 import time
 import uuid
+import logging
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -12,6 +13,13 @@ from telegram.ext import (
 )
 from pymongo import MongoClient
 from config import BOT_TOKEN, MONGO_URI, ADMIN_ID
+
+# ================= LOGGING =================
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 # ================= ADMIN GROUP IDS =================
 DEPOSIT_REQUESTS_GROUP   = -5291305798
@@ -32,6 +40,7 @@ deposits = db.deposits
 # ================= USER START =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
+    logger.info(f"User {u.id} ({u.username}) started the bot")
 
     users.update_one(
         {"telegram_id": u.id},
@@ -54,6 +63,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================= USER INPUT =================
 async def user_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    logger.info(f"User {user_id} sent input")
 
     if update.message.photo:
         context.user_data["screenshot"] = update.message.photo[-1].file_id
@@ -62,6 +72,10 @@ async def user_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if update.message.text:
         text = update.message.text.strip()
+        
+        # Check if this is a command (starts with /)
+        if text.startswith('/'):
+            return
 
         if "screenshot" not in context.user_data:
             await update.message.reply_text("❌ Send screenshot first.")
@@ -71,22 +85,28 @@ async def user_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Invalid UTR (12–18 digits).")
             return
 
-        msg = await context.bot.send_message(
-            DEPOSIT_REQUESTS_GROUP,
-            f"🟡 NEW DEPOSIT\nUser: {user_id}\nUTR: {text}\n\nCONFIRM {text}"
-        )
+        try:
+            msg = await context.bot.send_message(
+                DEPOSIT_REQUESTS_GROUP,
+                f"🟡 NEW DEPOSIT\nUser: {user_id}\nUTR: {text}\n\nCONFIRM {text}"
+            )
 
-        deposits.insert_one({
-            "user_id": user_id,
-            "utr": text,
-            "status": "REQUESTED",
-            "admin_msg_id": msg.message_id,
-            "created_at": time.time(),
-            "last_reminder": time.time()
-        })
+            deposits.insert_one({
+                "user_id": user_id,
+                "utr": text,
+                "status": "REQUESTED",
+                "admin_msg_id": msg.message_id,
+                "created_at": time.time(),
+                "last_reminder": time.time()
+            })
 
-        await update.message.reply_text("✅ Submitted. Await confirmation.")
-        context.user_data.clear()
+            await update.message.reply_text("✅ Submitted. Await confirmation.")
+            logger.info(f"Deposit request created for user {user_id}, UTR: {text}")
+        except Exception as e:
+            logger.error(f"Error creating deposit request: {e}")
+            await update.message.reply_text("❌ An error occurred. Please try again.")
+        finally:
+            context.user_data.clear()
 
 # ================= ADMIN CONFIRM =================
 async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -105,73 +125,108 @@ async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        await context.bot.delete_message(
-            DEPOSIT_REQUESTS_GROUP if dep["status"] == "REQUESTED" else DEPOSIT_PENDING_GROUP,
-            dep["admin_msg_id"]
-        )
-    except:
-        pass
+        # Delete from current group
+        if dep["status"] == "REQUESTED":
+            await context.bot.delete_message(DEPOSIT_REQUESTS_GROUP, dep["admin_msg_id"])
+        elif dep["status"] == "PENDING":
+            await context.bot.delete_message(DEPOSIT_PENDING_GROUP, dep["admin_msg_id"])
+    except Exception as e:
+        logger.warning(f"Could not delete message: {e}")
 
+    # Update deposit status
     deposits.update_one({"_id": dep["_id"]}, {"$set": {"status": "COMPLETED"}})
-
-    await context.bot.send_message(
-        DEPOSIT_COMPLETED_GROUP,
-        f"✅ COMPLETED\nUser: {dep['user_id']}\nUTR: {utr}"
+    
+    # Update user balance
+    users.update_one(
+        {"telegram_id": dep["user_id"]},
+        {"$inc": {"balance": 100, "total_deposit": 100}}  # Adjust amount as needed
     )
 
-    await context.bot.send_message(dep["user_id"], "✅ Deposit confirmed.")
+    try:
+        await context.bot.send_message(
+            DEPOSIT_COMPLETED_GROUP,
+            f"✅ COMPLETED\nUser: {dep['user_id']}\nUTR: {utr}"
+        )
+
+        await context.bot.send_message(dep["user_id"], "✅ Deposit confirmed. Your balance has been updated.")
+        logger.info(f"Deposit confirmed for UTR: {utr}")
+    except Exception as e:
+        logger.error(f"Error sending confirmation: {e}")
 
 # ================= WATCHER =================
 async def deposit_watcher(app):
+    logger.info("Deposit watcher started")
     while True:
-        now = time.time()
+        try:
+            now = time.time()
 
-        for d in deposits.find({"status": "REQUESTED"}):
-            if now - d.get("created_at", now) > REQUEST_TIMEOUT:
-                try:
-                    await app.bot.delete_message(
-                        DEPOSIT_REQUESTS_GROUP, d["admin_msg_id"]
+            # Move REQUESTED to PENDING after timeout
+            for d in deposits.find({"status": "REQUESTED"}):
+                if now - d.get("created_at", now) > REQUEST_TIMEOUT:
+                    try:
+                        await app.bot.delete_message(
+                            DEPOSIT_REQUESTS_GROUP, d["admin_msg_id"]
+                        )
+                    except Exception as e:
+                        logger.warning(f"Could not delete request message: {e}")
+
+                    msg = await app.bot.send_message(
+                        DEPOSIT_PENDING_GROUP,
+                        f"🟠 PENDING\nUser: {d['user_id']}\nUTR: {d['utr']}"
                     )
-                except:
-                    pass
 
-                msg = await app.bot.send_message(
-                    DEPOSIT_PENDING_GROUP,
-                    f"🟠 PENDING\nUser: {d['user_id']}\nUTR: {d['utr']}"
-                )
+                    deposits.update_one(
+                        {"_id": d["_id"]},
+                        {"$set": {
+                            "status": "PENDING",
+                            "admin_msg_id": msg.message_id,
+                            "last_reminder": now
+                        }}
+                    )
+                    logger.info(f"Moved deposit {d['utr']} to PENDING")
 
-                deposits.update_one(
-                    {"_id": d["_id"]},
-                    {"$set": {
-                        "status": "PENDING",
-                        "admin_msg_id": msg.message_id,
-                        "last_reminder": now
-                    }}
-                )
+            # Send reminders for PENDING deposits
+            for d in deposits.find({"status": "PENDING"}):
+                if now - d.get("last_reminder", now) > PENDING_REMINDER:
+                    await app.bot.send_message(
+                        DEPOSIT_PENDING_GROUP,
+                        f"⏰ STILL PENDING\nUTR: {d['utr']}"
+                    )
+                    deposits.update_one(
+                        {"_id": d["_id"]},
+                        {"$set": {"last_reminder": now}}
+                    )
+                    logger.info(f"Sent reminder for UTR: {d['utr']}")
 
-        for d in deposits.find({"status": "PENDING"}):
-            if now - d.get("last_reminder", now) > PENDING_REMINDER:
-                await app.bot.send_message(
-                    DEPOSIT_PENDING_GROUP,
-                    f"⏰ STILL PENDING\nUTR: {d['utr']}"
-                )
-                deposits.update_one(
-                    {"_id": d["_id"]},
-                    {"$set": {"last_reminder": now}}
-                )
-
-        await asyncio.sleep(30)
+            await asyncio.sleep(30)
+        except Exception as e:
+            logger.error(f"Error in deposit_watcher: {e}")
+            await asyncio.sleep(10)
 
 # ================= POST INIT =================
-async def post_init(app):
-    asyncio.create_task(deposit_watcher(app))
+async def post_init(application):
+    logger.info("Bot started. Setting up background tasks...")
+    asyncio.create_task(deposit_watcher(application))
 
 # ================= MAIN =================
-app = ApplicationBuilder().token(BOT_TOKEN).build()
-app.post_init = post_init
+def main():
+    # Create application
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    
+    # Set up handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.User(ADMIN_ID) & filters.TEXT & ~filters.COMMAND, admin_handler))
+    application.add_handler(MessageHandler((filters.PHOTO | filters.TEXT) & ~filters.COMMAND, user_input))
+    
+    # Set post initialization
+    application.post_init = post_init
+    
+    # Start the bot
+    logger.info("Starting bot...")
+    application.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES
+    )
 
-app.add_handler(CommandHandler("start", start))
-app.add_handler(MessageHandler(filters.User(ADMIN_ID) & filters.TEXT, admin_handler))
-app.add_handler(MessageHandler(filters.PHOTO | filters.TEXT, user_input))
-
-app.run_polling(drop_pending_updates=True)
+if __name__ == '__main__':
+    main()
