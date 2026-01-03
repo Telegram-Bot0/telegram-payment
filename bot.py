@@ -71,8 +71,8 @@ def init_db():
 
 users_col, deposits_col, withdrawals_col, mongo_client = init_db()
 
-# Check if database is connected
-DB_CONNECTED = all([users_col, deposits_col, withdrawals_col])
+# Check if database is connected properly
+DB_CONNECTED = users_col is not None and deposits_col is not None and withdrawals_col is not None
 
 # ================= CONSTANTS =================
 UTR_REGEX = r"^\d{12,18}$"
