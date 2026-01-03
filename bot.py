@@ -1004,7 +1004,7 @@ def main():
                 CommandHandler("help", help_command),
             ],
             allow_reentry=True,
-            per_message=True  # Fix the PTBUserWarning
+            per_message=False  # Fix the PTBUserWarning
         )
         
         # Add handlers
