@@ -1018,9 +1018,25 @@ def main():
         # Set post initialization
         app.post_init = post_init
         
-        # Add error handler
+        # Add error handler with CONFLICT detection
         async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-            logger.error(f"Update {update} caused error {context.error}")
+            error_msg = str(context.error) if context.error else "Unknown error"
+            logger.error(f"Update {update} caused error: {error_msg}")
+            
+            # CRITICAL: Stop bot if conflict detected (multiple instances)
+            if "Conflict" in error_msg and "terminated by other getUpdates request" in error_msg:
+                logger.error("🚨 CONFLICT DETECTED: Another bot instance is running. Stopping this instance.")
+                # Send notification to admin before stopping
+                try:
+                    await context.bot.send_message(
+                        ADMIN_ID,
+                        "⚠️ Bot Conflict Detected\nAnother instance is running. This instance will stop."
+                    )
+                except:
+                    pass
+                # Force stop
+                os._exit(1)
+            
             if update and update.effective_chat:
                 try:
                     await context.bot.send_message(
