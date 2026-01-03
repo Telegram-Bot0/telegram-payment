@@ -1,217 +1,207 @@
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import asyncio
+import re
+import time
+import uuid
+from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
-    CallbackQueryHandler,
     MessageHandler,
     ContextTypes,
     filters,
 )
 from pymongo import MongoClient
-import uuid
-
 from config import BOT_TOKEN, MONGO_URI, ADMIN_ID
 
-# ---------------- DATABASE ----------------
+# ================= CONFIG =================
+DEPOSIT_REQUESTS_GROUP = -5291305798
+DEPOSIT_PENDING_GROUP  = -5266076639
+DEPOSIT_COMPLETED_GROUP = -5204290005
+
+UTR_REGEX = r"^\d{12,18}$"
+REQUEST_TIMEOUT = 120      # 2 minutes
+PENDING_REMINDER = 60      # 1 minute
+
+# ================= DB =================
 client = MongoClient(MONGO_URI)
 db = client.telegrambot
-users_col = db.users
-deposits_col = db.deposits
-settings_col = db.settings  # for match code
+users = db.users
+deposits = db.deposits
 
-# ---------------- TEMP STATE ----------------
-user_deposits = {}
-
-# ---------------- START ----------------
+# ================= START =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-
-    if not users_col.find_one({"telegram_id": user.id}):
-        users_col.insert_one({
-            "telegram_id": user.id,
-            "username": user.username,
+    u = update.effective_user
+    if not users.find_one({"telegram_id": u.id}):
+        users.insert_one({
+            "telegram_id": u.id,
+            "username": u.username,
             "uid": str(uuid.uuid4())[:8],
+            "balance": 0,
+            "total_deposit": 0,
         })
 
-    await show_main_menu(update.message)
-
-async def show_main_menu(message):
-    keyboard = [
-        [InlineKeyboardButton("Deposit", callback_data="deposit")],
-        [InlineKeyboardButton("Withdraw", callback_data="withdraw")],
-        [InlineKeyboardButton("Match Code", callback_data="match")],
-        [InlineKeyboardButton("Referral", callback_data="referral")],
-    ]
-    await message.reply_text(
-        "Welcome. Choose an option:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+    await update.message.reply_text(
+        "Welcome.\n\nSend:\n"
+        "• Screenshot of payment\n"
+        "• Then UTR number"
     )
 
-# ---------------- BUTTON HANDLER ----------------
-async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-
-    if user_id not in user_deposits:
-        user_deposits[user_id] = 0
-
-    # DEPOSIT MENU
-    if query.data == "deposit":
-        user_deposits[user_id] = 0
-        await show_amount_menu(query, 0)
-
-    # ADD AMOUNT
-    elif query.data.startswith("add_"):
-        amt = int(query.data.split("_")[1])
-        user_deposits[user_id] += amt
-        await show_amount_menu(query, user_deposits[user_id])
-
-    # PAY NOW
-    elif query.data == "pay_now":
-        total = user_deposits.get(user_id, 0)
-        if total == 0:
-            await query.message.reply_text("Please select amount first.")
-            return
-
-        await query.message.reply_photo(
-            photo=open("qr.jpg", "rb"),
-            caption=f"Pay ₹{total} using this QR.\n\nAfter payment click **Payment Done**.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Payment Done", callback_data="payment_done")]
-            ])
-        )
-
-    # PAYMENT DONE
-    elif query.data == "payment_done":
-        context.user_data["awaiting_payment"] = True
-        await query.message.reply_text(
-            "Please send:\n1️⃣ Payment Screenshot\n2️⃣ UTR Number"
-        )
-
-    # MATCH CODE (USER VIEW)
-    elif query.data == "match":
-        data = settings_col.find_one({"key": "match_code"})
-        if data:
-            await query.message.reply_text(f"📌 Current Match Code:\n\n{data['value']}")
-        else:
-            await query.message.reply_text("No match code set yet.")
-
-# ---------------- SHOW AMOUNT MENU ----------------
-async def show_amount_menu(query, total):
-    keyboard = [
-        [
-            InlineKeyboardButton("₹10", callback_data="add_10"),
-            InlineKeyboardButton("₹50", callback_data="add_50"),
-        ],
-        [
-            InlineKeyboardButton("₹100", callback_data="add_100"),
-            InlineKeyboardButton("₹200", callback_data="add_200"),
-        ],
-        [
-            InlineKeyboardButton("₹300", callback_data="add_300"),
-        ],
-        [
-            InlineKeyboardButton("Proceed to Pay", callback_data="pay_now"),
-        ],
-    ]
-    await query.message.edit_text(
-        f"Select deposit amounts (tap multiple times):\n\nTotal: ₹{total}",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-
-# ---------------- PAYMENT DETAILS ----------------
-async def handle_payment_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("awaiting_payment"):
-        return
-
-    user_id = update.effective_user.id
+# ================= USER INPUT =================
+async def user_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
 
     if update.message.photo:
         context.user_data["screenshot"] = update.message.photo[-1].file_id
-        await update.message.reply_text("Screenshot received. Now send UTR number.")
+        context.user_data["screenshot_time"] = time.time()
+        await update.message.reply_text("Screenshot received. Now send UTR.")
+        return
 
-    elif update.message.text:
-        utr = update.message.text.strip()
-        total = user_deposits.get(user_id, 0)
+    if update.message.text:
+        text = update.message.text.strip()
 
-        deposits_col.insert_one({
-            "telegram_id": user_id,
-            "amount": total,
-            "utr": utr,
-            "status": "PENDING",
+        if not context.user_data.get("screenshot"):
+            await update.message.reply_text("Please send payment screenshot first.")
+            return
+
+        if not re.match(UTR_REGEX, text):
+            await update.message.reply_text(
+                "Invalid UTR.\nUTR must be 12–18 digits."
+            )
+            return
+
+        amount = 0  # you can wire this with your amount logic
+        dep_id = str(uuid.uuid4())
+
+        msg = await context.bot.send_message(
+            DEPOSIT_REQUESTS_GROUP,
+            f"🟡 NEW DEPOSIT REQUEST\n\n"
+            f"User ID: {uid}\n"
+            f"UTR: {text}\n\n"
+            f"Reply:\nCONFIRM {text}"
+        )
+
+        deposits.insert_one({
+            "deposit_id": dep_id,
+            "user_id": uid,
+            "utr": text,
+            "amount": amount,
+            "status": "REQUESTED",
+            "admin_msg_id": msg.message_id,
+            "created_at": time.time(),
+            "last_reminder": time.time(),
         })
 
         await update.message.reply_text(
-            f"Deposit submitted.\n\nAmount: ₹{total}\nUTR: {utr}\n\nWaiting for confirmation."
-        )
-
-        await context.bot.send_message(
-            ADMIN_ID,
-            f"NEW DEPOSIT\nUser: {user_id}\nAmount: ₹{total}\nUTR: {utr}\n\nReply:\nCONFIRM {utr}"
+            "Deposit submitted.\nWaiting for confirmation."
         )
 
         context.user_data.clear()
-        user_deposits[user_id] = 0
 
-# ---------------- ADMIN CONFIRMATION ----------------
-async def handle_admin_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ================= ADMIN COMMAND =================
+async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
 
     text = update.message.text.strip()
 
-    # SET MATCH CODE
-    if text.startswith("SETMATCH "):
-        code = text.replace("SETMATCH ", "").strip()
-        settings_col.update_one(
-            {"key": "match_code"},
-            {"$set": {"value": code}},
-            upsert=True
-        )
-        await update.message.reply_text("Match code updated.")
-        return
-
-    # CONFIRM DEPOSIT
     if not text.startswith("CONFIRM "):
         return
 
-    utr = text.split(" ", 1)[1]
-    dep = deposits_col.find_one({"utr": utr, "status": "PENDING"})
+    utr = text.split()[1]
+    dep = deposits.find_one({"utr": utr})
 
     if not dep:
-        await update.message.reply_text("No pending deposit found.")
+        await update.message.reply_text("No such deposit.")
         return
 
-    deposits_col.update_one(
+    # delete old admin message
+    try:
+        await context.bot.delete_message(
+            DEPOSIT_PENDING_GROUP if dep["status"] == "PENDING" else DEPOSIT_REQUESTS_GROUP,
+            dep["admin_msg_id"]
+        )
+    except:
+        pass
+
+    # mark completed
+    deposits.update_one(
         {"_id": dep["_id"]},
-        {"$set": {"status": "CONFIRMED"}}
+        {"$set": {"status": "COMPLETED"}}
     )
 
     await context.bot.send_message(
-        dep["telegram_id"],
-        f"✅ Deposit Confirmed\n\nAmount: ₹{dep['amount']}\nUTR: {utr}"
+        DEPOSIT_COMPLETED_GROUP,
+        f"✅ DEPOSIT COMPLETED\n\n"
+        f"User: {dep['user_id']}\n"
+        f"UTR: {utr}"
+    )
+
+    users.update_one(
+        {"telegram_id": dep["user_id"]},
+        {"$inc": {"balance": dep["amount"], "total_deposit": dep["amount"]}}
+    )
+
+    await context.bot.send_message(
+        dep["user_id"],
+        "✅ Deposit confirmed."
     )
 
     await update.message.reply_text("Deposit confirmed.")
 
-# ---------------- FALLBACK (PROFESSIONAL) ----------------
-async def handle_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Please use the menu buttons below to continue.",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("Open Menu", callback_data="deposit")]
-        ])
-    )
+# ================= WATCHER TASK =================
+async def deposit_watcher(app):
+    while True:
+        now = time.time()
+        for d in deposits.find({"status": "REQUESTED"}):
+            if now - d["created_at"] > REQUEST_TIMEOUT:
+                try:
+                    await app.bot.delete_message(
+                        DEPOSIT_REQUESTS_GROUP,
+                        d["admin_msg_id"]
+                    )
+                except:
+                    pass
 
-# ---------------- MAIN ----------------
-app = ApplicationBuilder().token(BOT_TOKEN).build()
+                msg = await app.bot.send_message(
+                    DEPOSIT_PENDING_GROUP,
+                    f"🟠 DEPOSIT PENDING\n\n"
+                    f"User: {d['user_id']}\n"
+                    f"UTR: {d['utr']}"
+                )
+
+                deposits.update_one(
+                    {"_id": d["_id"]},
+                    {"$set": {
+                        "status": "PENDING",
+                        "admin_msg_id": msg.message_id,
+                        "last_reminder": now
+                    }}
+                )
+
+        for d in deposits.find({"status": "PENDING"}):
+            if now - d["last_reminder"] > PENDING_REMINDER:
+                await app.bot.send_message(
+                    DEPOSIT_PENDING_GROUP,
+                    f"⏰ STILL PENDING\nUTR: {d['utr']}"
+                )
+                deposits.update_one(
+                    {"_id": d["_id"]},
+                    {"$set": {"last_reminder": now}}
+                )
+
+        await asyncio.sleep(30)
+
+# ================= MAIN =================
+app = (
+    ApplicationBuilder()
+    .token(BOT_TOKEN)
+    .build()
+)
 
 app.add_handler(CommandHandler("start", start))
-app.add_handler(CallbackQueryHandler(handle_buttons))
-app.add_handler(MessageHandler(filters.User(ADMIN_ID) & filters.TEXT, handle_admin_confirmation))
-app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, handle_payment_details))
-app.add_handler(MessageHandler(filters.ALL, handle_unknown))
+app.add_handler(MessageHandler(filters.User(ADMIN_ID) & filters.TEXT, admin_handler))
+app.add_handler(MessageHandler(filters.PHOTO | filters.TEXT, user_input))
 
-app.run_polling(close_loop=False)
+app.job_queue.run_once(lambda _: asyncio.create_task(deposit_watcher(app)), 1)
+
+app.run_polling(drop_pending_updates=True, close_loop=False)
