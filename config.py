@@ -5,4 +5,4 @@ DEPOSIT_PENDING_GROUP_ID = -1003415130807
 DEPOSIT_COMPLETED_GROUP_ID = -1003513719508
 WITHDRAW_REQUESTS_GROUP_ID = -1003522192758  # Use deposit group for now
 WITHDRAW_COMPLETED_GROUP_ID = -1003637541728  # Use deposit group for now
-MONGO_URI = "mongodb+srv://telegram-payment-bot:Jatin161@telegram-payment-bot.cabji2f.mongodb.net/telegram_payment_bot?retryWrites=true&w=majority"
+MONGO_URI = "mongodb+srv://telegram-payment-bot:Jatin161@telegram-payment-bot.cabji2f.mongodb.net/?retryWrites=true&w=majority&serverSelectionTimeoutMS=10000&connectTimeoutMS=10000&socketTimeoutMS=10000"
