@@ -4,8 +4,6 @@ import logging
 import re
 import time
 import uuid
-import signal
-import sys
 from datetime import datetime, timezone
 from typing import Dict, List
 
@@ -852,144 +850,102 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text("❌ Error rejecting withdrawal")
 
 # ================= BACKGROUND TASKS =================
-class BackgroundTaskManager:
-    """Manage background tasks"""
-    def __init__(self):
-        self.task = None
-        self.running = False
+async def deposit_reminder_task(application):
+    """Monitor deposits and send reminders"""
+    logger.info("Deposit reminder task started")
     
-    async def deposit_reminder_task(self, application):
-        """Monitor deposits and send reminders"""
-        logger.info("Deposit reminder task started")
-        self.running = True
-        
-        while self.running:
-            try:
-                if DB_CONNECTED:
-                    now = datetime.now(timezone.utc)
+    while True:
+        try:
+            if DB_CONNECTED:
+                now = datetime.now(timezone.utc)
+                
+                # Find pending deposits
+                pending_deposits = list(deposits_col.find({
+                    "status": {"$in": ["REQUESTED", "PENDING"]},
+                    "reminder_count": {"$lt": MAX_REMINDERS}
+                }))
+                
+                for deposit in pending_deposits:
+                    time_diff = (now - deposit.get("last_reminder", deposit["created_at"])).total_seconds()
                     
-                    # Find pending deposits
-                    pending_deposits = list(deposits_col.find({
-                        "status": {"$in": ["REQUESTED", "PENDING"]},
-                        "reminder_count": {"$lt": MAX_REMINDERS}
-                    }))
-                    
-                    for deposit in pending_deposits:
-                        time_diff = (now - deposit.get("last_reminder", deposit["created_at"])).total_seconds()
+                    if time_diff >= REMINDER_INTERVAL:
+                        reminder_count = deposit.get("reminder_count", 0) + 1
                         
-                        if time_diff >= REMINDER_INTERVAL:
-                            reminder_count = deposit.get("reminder_count", 0) + 1
-                            
-                            # Update reminder info
+                        # Update reminder info
+                        deposits_col.update_one(
+                            {"_id": deposit["_id"]},
+                            {
+                                "$set": {
+                                    "last_reminder": now,
+                                    "status": "PENDING" if reminder_count > 0 else "REQUESTED"
+                                },
+                                "$inc": {"reminder_count": 1}
+                            }
+                        )
+                        
+                        # Send reminder to admin group
+                        try:
+                            await application.bot.send_message(
+                                DEPOSIT_PENDING_GROUP_ID,
+                                f"🟠 *DEPOSIT REMINDER #{reminder_count}*\n\n"
+                                f"• User: @{deposit.get('username', 'N/A')}\n"
+                                f"• Amount: ₹{deposit['amount']}\n"
+                                f"• UTR: `{deposit.get('utr', 'N/A')}`\n"
+                                f"• Request ID: `{deposit.get('request_id', 'N/A')}`\n"
+                                f"• Pending for: {int((now - deposit['created_at']).total_seconds() / 60)} min\n"
+                                f"• Reminder: {reminder_count}/{MAX_REMINDERS}\n\n"
+                                f"Confirm: `/confirm {deposit.get('utr', '')}`",
+                                parse_mode='Markdown'
+                            )
+                        except Exception as e:
+                            logger.error(f"Error sending reminder: {e}")
+                        
+                        # Auto-cancel after MAX_REMINDERS
+                        if reminder_count >= MAX_REMINDERS:
                             deposits_col.update_one(
                                 {"_id": deposit["_id"]},
-                                {
-                                    "$set": {
-                                        "last_reminder": now,
-                                        "status": "PENDING" if reminder_count > 0 else "REQUESTED"
-                                    },
-                                    "$inc": {"reminder_count": 1}
-                                }
+                                {"$set": {"status": "AUTO_CANCELLED", "cancelled_at": now}}
                             )
                             
-                            # Send reminder to admin group
+                            # Notify user
                             try:
                                 await application.bot.send_message(
-                                    DEPOSIT_PENDING_GROUP_ID,
-                                    f"🟠 *DEPOSIT REMINDER #{reminder_count}*\n\n"
-                                    f"• User: @{deposit.get('username', 'N/A')}\n"
-                                    f"• Amount: ₹{deposit['amount']}\n"
-                                    f"• UTR: `{deposit.get('utr', 'N/A')}`\n"
-                                    f"• Request ID: `{deposit.get('request_id', 'N/A')}`\n"
-                                    f"• Pending for: {int((now - deposit['created_at']).total_seconds() / 60)} min\n"
-                                    f"• Reminder: {reminder_count}/{MAX_REMINDERS}\n\n"
-                                    f"Confirm: `/confirm {deposit.get('utr', '')}`",
+                                    deposit["user_id"],
+                                    f"❌ *Deposit Auto-Cancelled*\n\n"
+                                    f"Amount: ₹{deposit['amount']}\n"
+                                    f"UTR: `{deposit.get('utr', 'N/A')}`\n"
+                                    f"Request ID: `{deposit.get('request_id', 'N/A')}`\n\n"
+                                    f"Your deposit request was cancelled after {MAX_REMINDERS} reminders.",
+                                    reply_markup=get_main_menu_keyboard(),
                                     parse_mode='Markdown'
                                 )
                             except Exception as e:
-                                logger.error(f"Error sending reminder: {e}")
+                                logger.error(f"Error notifying user of auto-cancellation: {e}")
                             
-                            # Auto-cancel after MAX_REMINDERS
-                            if reminder_count >= MAX_REMINDERS:
-                                deposits_col.update_one(
-                                    {"_id": deposit["_id"]},
-                                    {"$set": {"status": "AUTO_CANCELLED", "cancelled_at": now}}
+                            # Notify admin
+                            try:
+                                await application.bot.send_message(
+                                    DEPOSIT_REQUESTS_GROUP_ID,
+                                    f"❌ DEPOSIT AUTO-CANCELLED\n"
+                                    f"User: {deposit['user_id']}\n"
+                                    f"Amount: ₹{deposit['amount']}\n"
+                                    f"UTR: {deposit.get('utr', 'N/A')}"
                                 )
-                                
-                                # Notify user
-                                try:
-                                    await application.bot.send_message(
-                                        deposit["user_id"],
-                                        f"❌ *Deposit Auto-Cancelled*\n\n"
-                                        f"Amount: ₹{deposit['amount']}\n"
-                                        f"UTR: `{deposit.get('utr', 'N/A')}`\n"
-                                        f"Request ID: `{deposit.get('request_id', 'N/A')}`\n\n"
-                                        f"Your deposit request was cancelled after {MAX_REMINDERS} reminders.",
-                                        reply_markup=get_main_menu_keyboard(),
-                                        parse_mode='Markdown'
-                                    )
-                                except Exception as e:
-                                    logger.error(f"Error notifying user of auto-cancellation: {e}")
-                                
-                                # Notify admin
-                                try:
-                                    await application.bot.send_message(
-                                        DEPOSIT_REQUESTS_GROUP_ID,
-                                        f"❌ DEPOSIT AUTO-CANCELLED\n"
-                                        f"User: {deposit['user_id']}\n"
-                                        f"Amount: ₹{deposit['amount']}\n"
-                                        f"UTR: {deposit.get('utr', 'N/A')}"
-                                    )
-                                except:
-                                    pass
-                
-                await asyncio.sleep(30)  # Check every 30 seconds
-                
-            except asyncio.CancelledError:
-                logger.info("Deposit reminder task cancelled")
-                self.running = False
-                break
-            except Exception as e:
-                logger.error(f"Error in deposit reminder task: {e}")
-                await asyncio.sleep(60)
-    
-    async def start(self, application):
-        """Start background task"""
-        self.task = asyncio.create_task(self.deposit_reminder_task(application))
-    
-    async def stop(self):
-        """Stop background task"""
-        self.running = False
-        if self.task:
-            self.task.cancel()
-            try:
-                await self.task
-            except asyncio.CancelledError:
-                pass
-        logger.info("Background tasks stopped")
-
-# ================= SHUTDOWN HANDLING =================
-async def shutdown_handler(signum, application, task_manager):
-    """Handle shutdown signals"""
-    logger.info(f"Received signal {signum}, shutting down...")
-    
-    # Stop background tasks
-    await task_manager.stop()
-    
-    # Stop the application
-    if application.running:
-        await application.stop()
-        await application.shutdown()
-    
-    logger.info("Bot shutdown complete")
-    sys.exit(0)
+                            except:
+                                pass
+            
+            await asyncio.sleep(30)  # Check every 30 seconds
+            
+        except Exception as e:
+            logger.error(f"Error in deposit reminder task: {e}")
+            await asyncio.sleep(60)
 
 # ================= MAIN =================
-async def post_init(application, task_manager):
+async def post_init(application):
     """Post initialization"""
     logger.info("Bot initialized")
     # Start background tasks
-    await task_manager.start(application)
+    asyncio.create_task(deposit_reminder_task(application))
 
 def main():
     """Main function"""
@@ -1005,9 +961,6 @@ def main():
     try:
         # Create application
         app = Application.builder().token(BOT_TOKEN).build()
-        
-        # Create task manager
-        task_manager = BackgroundTaskManager()
         
         # Conversation handler
         conv_handler = ConversationHandler(
@@ -1051,7 +1004,7 @@ def main():
                 CommandHandler("help", help_command),
             ],
             allow_reentry=True,
-            per_message=False
+            per_message=False  # Changed back to False to fix the warning
         )
         
         # Add handlers
@@ -1062,26 +1015,12 @@ def main():
             handle_admin_message
         ))
         
-        # Custom post_init with task manager
-        async def custom_post_init(application):
-            await post_init(application, task_manager)
-        
-        app.post_init = custom_post_init
+        # Set post initialization
+        app.post_init = post_init
         
         # Add error handler
         async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-            error_msg = str(context.error) if context.error else "Unknown error"
-            logger.error(f"Update {update} caused error: {error_msg}")
-            
-            # Don't send error messages for 409 conflicts (multiple instances)
-            if "Conflict" in error_msg and "terminated by other getUpdates request" in error_msg:
-                logger.warning("Multiple bot instances detected. This instance will stop.")
-                # Stop this instance gracefully
-                await task_manager.stop()
-                if app.running:
-                    await app.stop()
-                sys.exit(0)
-            
+            logger.error(f"Update {update} caused error {context.error}")
             if update and update.effective_chat:
                 try:
                     await context.bot.send_message(
@@ -1093,29 +1032,17 @@ def main():
         
         app.add_error_handler(error_handler)
         
-        # Setup signal handlers for graceful shutdown
-        import signal as signal_module
-        loop = asyncio.get_event_loop()
-        
-        for sig in (signal_module.SIGTERM, signal_module.SIGINT):
-            loop.add_signal_handler(
-                sig,
-                lambda s=sig: asyncio.create_task(shutdown_handler(s, app, task_manager))
-            )
-        
         # Start bot
         logger.info("Starting bot polling...")
         app.run_polling(
             drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES,
-            close_loop=False  # Don't close the loop, we handle it
+            allowed_updates=Update.ALL_TYPES
         )
         
     except Exception as e:
         logger.error(f"Bot error: {e}")
         import traceback
         traceback.print_exc()
-        sys.exit(1)
 
 if __name__ == "__main__":
     main()
