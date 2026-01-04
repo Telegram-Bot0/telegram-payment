@@ -1,13 +1,16 @@
 services:
-  - type: worker  # <-- THIS MUST BE "worker" not "web"
+  - type: web
     name: telegram-payment-bot
     env: python
     region: oregon
     plan: free
     autoDeploy: true
     buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120
+    healthCheckPath: /
     envVars:
+      - key: PORT
+        value: "10000"
       - key: BOT_TOKEN
         value: "7998689373:AAGUaTxrHzWabJvqZAUM2NjRQb1PHXpmGqA"
       - key: ADMIN_ID
