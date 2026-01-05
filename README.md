@@ -11,6 +11,7 @@ A professional, menu-based Telegram bot for manual payment verification with aut
 - **Automatic Tracking** - Time-based movement between groups with reminders
 - **Balance Management** - Real-time balance updates
 - **Safe & Secure** - Manual admin approval for all transactions
+- **Web Dashboard** - Online status monitoring and health checks
 
 ## Prerequisites
 
@@ -18,6 +19,7 @@ A professional, menu-based Telegram bot for manual payment verification with aut
 2. MongoDB database (local or Atlas)
 3. Telegram account with admin rights
 4. Telegram Bot Token from @BotFather
+5. Render account (for free hosting)
 
 ## Setup Instructions
 
@@ -52,11 +54,12 @@ For each group:
 1. Go to [MongoDB Atlas](https://www.mongodb.com/cloud/atlas)
 2. Create free cluster
 3. Get connection string: `mongodb+srv://username:password@cluster.mongodb.net/`
+4. Add IP whitelist: `0.0.0.0/0` (allow all IPs)
 
 #### Option B: Local MongoDB
 1. Install MongoDB
 2. Connection string: `mongodb://localhost:27017/`
 
-### 5. Install Dependencies
+### 5. Install Dependencies (Local Testing)
 ```bash
 pip install -r requirements.txt
