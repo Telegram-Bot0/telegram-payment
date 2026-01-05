@@ -6,6 +6,9 @@ import time
 import uuid
 from datetime import datetime, timezone
 from typing import Dict, List
+from dotenv import load_dotenv
+
+load_dotenv()  # This loads variables from .env file
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
