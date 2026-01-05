@@ -7,6 +7,9 @@ import asyncio
 from queue import Queue
 import subprocess
 import sys
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Setup logging
 logging.basicConfig(
