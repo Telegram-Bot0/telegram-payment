@@ -338,6 +338,76 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return MAIN_MENU
     
+    elif data == "confirm_withdraw":
+        # Handle withdrawal confirmation
+        data_dict = context.user_data.get("withdraw_data", {})
+        upi_id = data_dict.get("upi_id")
+        amount = data_dict.get("amount")
+        user_id = query.from_user.id
+        user = get_or_create_user(user_id, query.from_user.username)
+        
+        if not upi_id or not amount:
+            await query.edit_message_text(
+                "❌ Error. Please start over.",
+                reply_markup=get_main_menu_keyboard()
+            )
+            return MAIN_MENU
+        
+        # Double-check balance
+        if user.get("balance", 0) < amount:
+            await query.edit_message_text(
+                f"❌ Insufficient balance. Current balance: ₹{user.get('balance', 0):.0f}",
+                reply_markup=get_main_menu_keyboard()
+            )
+            return MAIN_MENU
+        
+        withdrawal_id = str(uuid.uuid4())[:8]
+        
+        # Save withdrawal
+        if DB_CONNECTED:
+            try:
+                withdrawals_col.insert_one({
+                    "withdrawal_id": withdrawal_id,
+                    "user_id": user_id,
+                    "username": user.get("username", "N/A"),
+                    "upi_id": upi_id,
+                    "amount": amount,
+                    "status": "REQUESTED",
+                    "created_at": datetime.now(timezone.utc)
+                })
+            except Exception as e:
+                logger.error(f"Error saving withdrawal: {e}")
+        
+        # Notify admin
+        admin_text = (
+            f"🟡 *WITHDRAWAL REQUEST*\n\n"
+            f"• Request ID: `{withdrawal_id}`\n"
+            f"• User: @{user.get('username', 'N/A')}\n"
+            f"• User ID: `{user_id}`\n"
+            f"• Amount: ₹{amount}\n"
+            f"• UPI: `{upi_id}`\n\n"
+            f"To process: `/process {withdrawal_id}`\n"
+            f"To reject: `/reject {withdrawal_id}`"
+        )
+        
+        try:
+            await context.bot.send_message(WITHDRAW_REQUESTS_GROUP_ID, admin_text, parse_mode='Markdown')
+        except:
+            await context.bot.send_message(ADMIN_ID, admin_text)
+        
+        await query.edit_message_text(
+            f"✅ *Withdrawal Request Submitted!*\n\n"
+            f"Amount: ₹{amount}\n"
+            f"UPI ID: `{upi_id}`\n"
+            f"Request ID: `{withdrawal_id}`\n\n"
+            f"Awaiting admin processing.",
+            reply_markup=get_main_menu_keyboard(),
+            parse_mode='Markdown'
+        )
+        
+        context.user_data.clear()
+        return MAIN_MENU
+    
     return MAIN_MENU
 
 # ================= DEPOSIT HANDLERS =================
@@ -552,79 +622,6 @@ async def handle_upi_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
     return WITHDRAW_CONFIRM
-
-async def handle_confirm_withdraw_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle withdrawal confirmation from callback"""
-    query = update.callback_query
-    await query.answer()
-    
-    data = context.user_data.get("withdraw_data", {})
-    upi_id = data.get("upi_id")
-    amount = data.get("amount")
-    user_id = query.from_user.id
-    user = get_or_create_user(user_id, query.from_user.username)
-    
-    if not upi_id or not amount:
-        await query.edit_message_text(
-            "❌ Error. Please start over.",
-            reply_markup=get_main_menu_keyboard()
-        )
-        return MAIN_MENU
-    
-    # Double-check balance
-    if user.get("balance", 0) < amount:
-        await query.edit_message_text(
-            f"❌ Insufficient balance. Current balance: ₹{user.get('balance', 0):.0f}",
-            reply_markup=get_main_menu_keyboard()
-        )
-        return MAIN_MENU
-    
-    withdrawal_id = str(uuid.uuid4())[:8]
-    
-    # Save withdrawal
-    if DB_CONNECTED:
-        try:
-            withdrawals_col.insert_one({
-                "withdrawal_id": withdrawal_id,
-                "user_id": user_id,
-                "username": user.get("username", "N/A"),
-                "upi_id": upi_id,
-                "amount": amount,
-                "status": "REQUESTED",
-                "created_at": datetime.now(timezone.utc)
-            })
-        except Exception as e:
-            logger.error(f"Error saving withdrawal: {e}")
-    
-    # Notify admin
-    admin_text = (
-        f"🟡 *WITHDRAWAL REQUEST*\n\n"
-        f"• Request ID: `{withdrawal_id}`\n"
-        f"• User: @{user.get('username', 'N/A')}\n"
-        f"• User ID: `{user_id}`\n"
-        f"• Amount: ₹{amount}\n"
-        f"• UPI: `{upi_id}`\n\n"
-        f"To process: `/process {withdrawal_id}`\n"
-        f"To reject: `/reject {withdrawal_id}`"
-    )
-    
-    try:
-        await context.bot.send_message(WITHDRAW_REQUESTS_GROUP_ID, admin_text, parse_mode='Markdown')
-    except:
-        await context.bot.send_message(ADMIN_ID, admin_text)
-    
-    await query.edit_message_text(
-        f"✅ *Withdrawal Request Submitted!*\n\n"
-        f"Amount: ₹{amount}\n"
-        f"UPI ID: `{upi_id}`\n"
-        f"Request ID: `{withdrawal_id}`\n\n"
-        f"Awaiting admin processing.",
-        reply_markup=get_main_menu_keyboard(),
-        parse_mode='Markdown'
-    )
-    
-    context.user_data.clear()
-    return MAIN_MENU
 
 # ================= ADMIN HANDLER =================
 async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -967,7 +964,7 @@ def main():
             entry_points=[CommandHandler("start", start)],
             states={
                 MAIN_MENU: [
-                    CallbackQueryHandler(handle_callback_query, pattern="^(deposit|withdraw|user_info|help|back_to_main|cancel|cancel_deposit_.*)$"),
+                    CallbackQueryHandler(handle_callback_query, pattern="^(deposit|withdraw|user_info|help|back_to_main|cancel|cancel_deposit_.*|confirm_withdraw)$"),
                 ],
                 DEPOSIT_ENTER_AMOUNT: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, handle_deposit_amount),
@@ -993,7 +990,7 @@ def main():
                     CallbackQueryHandler(handle_callback_query, pattern="^cancel$"),
                 ],
                 WITHDRAW_CONFIRM: [
-                    CallbackQueryHandler(handle_confirm_withdraw_callback, pattern="^(confirm_withdraw|cancel)$"),
+                    CallbackQueryHandler(handle_callback_query, pattern="^(confirm_withdraw|cancel)$"),
                 ],
                 USER_INFO: [
                     CallbackQueryHandler(handle_callback_query, pattern="^back_to_main$"),
